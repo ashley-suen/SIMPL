@@ -1,0 +1,34 @@
+﻿Loading dataset from: ./data_av2/features/train/
+Found 20 samples.
+
+==================================================
+GENERATED PROMPT:
+==================================================
+Scenario '0925ba29-4dd0-43c7-9b5c-ae067c7fb7c0' in miami. Task: High-Fidelity Motion Prediction.
+[FOCAL AGENT HISTORY]
+Detailed trajectory: t=0:(-24.4,2.6)|V:9.0m/s -> t=5:(-21.2,2.4)|V:8.7m/s -> t=10:(-15.8,1.7)|V:8.3m/s -> t=15:(-11.3,0.8)|V:8.0m/s -> t=20:(-8.2,0.5)|V:6.5m/s -> t=25:(-5.3,0.3)|V:5.3m/s -> t=30:(-3.0,0.2)|V:4.3m/s -> t=35:(-1.5,0.1)|V:3.0m/s -> t=40:(-0.6,0.1)|V:1.6m/s -> t=45:(-0.1,0.0)|V:0.6m/s
+[NEIGHBOR AGENTS HISTORY]
+- Vehicle (av): currently ahead (15.7m), heading 87deg -> t=0:(14.4,-6.9)|V:0.0m/s -> t=10:(14.5,-6.2)|V:0.5m/s -> t=20:(14.5,-6.0)|V:0.1m/s -> t=30:(14.5,-6.0)|V:0.0m/s -> t=40:(14.5,-6.0)|V:0.0m/s
+- Static (score): currently right (14.1m), heading 88deg -> t=0:(7.5,-11.9)|V:0.0m/s -> t=10:(7.6,-11.9)|V:0.0m/s -> t=20:(7.4,-11.9)|V:0.0m/s -> t=30:(7.4,-11.9)|V:0.0m/s -> t=40:(7.4,-11.9)|V:0.0m/s
+- Vehicle (score): currently ahead (32.0m), heading 356deg -> t=0:(31.8,-4.1)|V:0.0m/s -> t=10:(31.8,-4.1)|V:0.0m/s -> t=20:(31.8,-3.9)|V:0.0m/s -> t=30:(31.8,-3.8)|V:0.0m/s -> t=40:(31.8,-3.8)|V:0.0m/s
+- Vehicle (unscore): currently right (69.2m), heading 268deg -> t=0:(5.1,-69.0)|V:0.0m/s -> t=10:(5.1,-69.0)|V:0.0m/s -> t=20:(5.1,-69.0)|V:0.0m/s -> t=30:(5.1,-69.0)|V:0.0m/s -> t=40:(5.1,-69.0)|V:0.0m/s
+- Vehicle (unscore): currently right (30.8m), heading 39deg -> t=0:(16.2,-26.2)|V:0.0m/s -> t=10:(16.4,-26.0)|V:0.0m/s -> t=20:(16.4,-26.0)|V:0.0m/s -> t=30:(16.3,-26.1)|V:0.0m/s -> t=40:(16.2,-26.2)|V:0.0m/s
+[LOCAL MAP TOPOLOGY & BOUNDARIES]
+- Intersection-Veh Lane at (7.9,-3.1): Left(bound:none, adj_lane:yes), Right(bound:none, adj_lane:no)
+- Intersection-Veh Lane at (8.3,5.2): Left(bound:none, adj_lane:yes), Right(bound:none, adj_lane:no)
+- Veh Lane at (-10.4,0.3): Left(bound:solid/uncrossable, adj_lane:yes), Right(bound:none, adj_lane:no)
+- Intersection-Veh Lane at (10.3,-1.1): Left(bound:none, adj_lane:yes), Right(bound:none, adj_lane:no)
+- Veh Lane at (-10.3,3.4): Left(bound:solid/uncrossable, adj_lane:yes), Right(bound:none, adj_lane:no)
+- Intersection-Veh Lane at (10.7,3.0): Left(bound:none, adj_lane:yes), Right(bound:none, adj_lane:no)
+- Intersection-Veh Lane at (11.4,1.0): Left(bound:none, adj_lane:yes), Right(bound:none, adj_lane:no)
+- Intersection-Veh Lane at (13.2,-0.8): Left(bound:none, adj_lane:yes), Right(bound:none, adj_lane:no)
+- Intersection-Veh Lane at (13.4,2.3): Left(bound:none, adj_lane:yes), Right(bound:none, adj_lane:no)
+- Intersection-Veh Lane at (15.3,0.7): Left(bound:none, adj_lane:yes), Right(bound:none, adj_lane:no)
+
+Understand the scene dynamics, speed, and road topology. Predict the exact (x, y) future coordinates of the Focal Agent for the next 60 future timesteps.
+[60-STEP PREDICTION]:
+==================================================
+Input IDs shape: torch.Size([1024])
+Ground Truth Trajectory shape: torch.Size([60, 2])
+==================================================
+

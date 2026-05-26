@@ -1,0 +1,135 @@
+
+========================================================================
+  1. CHECKPOINT INSPECTION
+========================================================================
+Keys        : ['epoch', 'state_dict', 'opt_state']
+Saved epoch : 6
+State dict  : 284 tensors
+NaN weights : 0  OK
+Inf weights : 0  OK
+  MLP head            : mean=-0.0004  std=0.0270  min=-0.1451  max=0.1463  (n=457,592)
+  Social attn         : mean=0.0004  std=0.0385  min=-0.2415  max=1.0654  (n=1,330,560)
+  LLM final norm      : mean=1.3692  std=0.3002  min=-0.0903  max=4.3438  (n=576)
+
+========================================================================
+  2. MODEL ARCHITECTURE & PARAMETER AUDIT
+========================================================================
+Trainable params : 5,328,824
+Frozen    params : 130,974,336
+Trainable layer names (first 10):
+  llm.layers.29.self_attn.q_proj.weight
+  llm.layers.29.self_attn.k_proj.weight
+  llm.layers.29.self_attn.v_proj.weight
+  llm.layers.29.self_attn.o_proj.weight
+  llm.layers.29.mlp.gate_proj.weight
+  llm.layers.29.mlp.up_proj.weight
+  llm.layers.29.mlp.down_proj.weight
+  llm.layers.29.input_layernorm.weight
+  llm.layers.29.post_attention_layernorm.weight
+  llm.norm.weight
+Parameter dtypes : {torch.float32}  OK (uniform)
+
+Dummy forward pass (B=2, N=6, L=128)...
+Output shape     : torch.Size([2, 6, 60, 2])  (expected [2, 6, 60, 2])
+Output NaN       : False
+Output Inf       : False
+Output mean/std  : 0.1162 / 0.2331
+Dummy slot (invalid agent) output norm: 1.010693 WARNING: should be suppressed by mask
+
+========================================================================
+  3. DATASET & PROMPT QUALITY
+========================================================================
+Val samples : 20
+Token length (per agent):  mean=659  median=194  p95=1368  max=1393 / 2000
+Truncated sequences       : 0/100 (0.0%) OK
+Agents per scene           : mean=5.0  min=3  max=6
+
+GT consistency (anchor+cumsum==abs): max_err=0.000000 m  OK
+Anchor norms (focal frame origin): mean=0.000  max=0.000  near-zero (correct)
+GT per-step displacement magnitude:8张
+  mean=0.4208 m  median=0.2055 m  p95=1.2174 m  max=1.5422 m
+  => Model must predict steps of this magnitude to achieve low ADE
+
+Sample prompt (first 600 chars):
+------------------------------------------------------------
+Scenario '1879fe1a-40a9-4f88-8bc2-f4f439261df1' in washington-dc. Task: High-
+Fidelity Motion Prediction. [SCENARIO IDENTIFICATION] Labels: Straight Roadway
+[AFFORDANCE & INTENTION] Focal Agent Intention: Keep-Straight Map Affordance:
+Lane-Change-Restricted-Left (Solid Line), Lane-Change-Allowed-Right  [AGENT
+HISTORY] * Focal Agent [Host]: t=0:(-11.2,-0.3)|V:0.4m/s ->
+t=1:(-11.1,-0.3)|V:1.3m/s -> t=2:(-10.9,-0.3)|V:2.6m/s ->
+t=3:(-10.7,-0.3)|V:3.6m/s -> t=4:(-10.5,-0.3)|V:4.4m/s ->
+t=5:(-10.3,-0.3)|V:4.9m/s -> t=6:(-10.1,-0.3)|V:5.0m/s ->
+t=7:(-9.9,-0.3)|V:4.9m/s -> t=8:(-9.7,-0.2)|V:4.5m/s ->
+------------------------------------------------------------
+
+========================================================================
+  4. COORDINATE FRAME ANALYSIS
+========================================================================
+Checking: are neighbor GT labels in the same frame as their prompt?
+(focal agent: always consistent; neighbors: prompt=focal frame, GT=own frame)
+Focal agent position at t=49 (should be ~origin): [0. 0.]
+  => CORRECT (focal frame centered at t=49)
+
+Neighbor agent 1:
+  trajs_pos[1, 49] (own frame) : [0. 0.]
+  ctr (position in focal frame): [ 28.960732 -13.879061]
+  Converted to focal frame     : [ 28.960732 -13.879061]
+  GT abs used in training      : [0. 0.]
+
+  FRAME MISMATCH for neighbors: prompt shows focal-frame coords,
+  but GT labels use each agent's OWN local frame.
+  => Neighbor losses are in wrong frame (focal agent loss is correct).
+  => minADE (focal only) is NOT affected, but neighbor training signal is noisy.
+
+========================================================================
+  5. INFERENCE: PREDICTION QUALITY (N=20 samples)
+========================================================================
+Predicted displacement magnitude (per step):
+  mean=0.6180  median=0.4884  std=0.4122  max=1.6719
+GT displacement magnitude (per step):
+  mean=0.6595  median=0.6359  std=0.4041  max=1.5422
+
+Pred/GT displacement ratio: 0.937 (OK)
+
+Predicted absolute position drift from anchor (cumsum):
+  mean=19.110  max=93.805 m
+
+minADE (focal agent, this audit set):
+  mean=6.8516 m  median=5.9239 m  p90=13.4915 m
+minFDE:
+  mean=15.8527 m  median=16.6213 m
+
+Near-zero predictions (mean step < 0.01m): 0/20 focal agents OK
+
+Mode collapse check (focal vs neighbour pred diff):
+  mean diff=0.2422  min=0.040083
+  OK: agents predict different trajectories
+
+========================================================================
+  6. SPEED-CONDITIONED ANALYSIS
+========================================================================
+Does the model predict more motion for faster agents?
+  stopped(0-0.5m/s)        : n=  1  pred_step_mean=0.0235 m
+  slow(0.5-5)              : n=  6  pred_step_mean=0.0875 m
+  medium(5-15)             : n= 13  pred_step_mean=0.1281 m
+  fast(>15)                : n=0
+
+========================================================================
+  7. SOCIAL ATTENTION CONTRIBUTION
+========================================================================
+Compare prediction with vs without social attention (by zeroing out other agents).
+Focal agent prediction change when neighbours masked out:
+  Mean step diff = 0.030644  Max step diff = 0.073878
+  Social attention has effect (good)
+
+========================================================================
+  8. SUMMARY & DIAGNOSIS
+========================================================================
+No critical issues found. Model architecture and data pipeline appear healthy.
+
+Key metric summary:
+  Focal minADE  (this audit): 6.8516 m
+  Pred/GT disp ratio        : 0.937
+  Token truncation rate     : 0.0%
+  Social attn effect        : 0.030644 m

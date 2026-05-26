@@ -1,0 +1,1040 @@
+ ▐▛███▜▌   Claude Code v2.1.126
+▝▜█████▛▘  Sonnet 4.6 · Claude Pro
+  ▘▘ ▝▝    E:\Msc\new\code\simpl_new\SIMPL_back
+
+✻ Conversation compacted (ctrl+o for history)
+
+
+❯ /compact                                                                      
+  ⎿  Compacted (ctrl+o to see full summary)
+  ⎿  Read debug_model_config.py (60 lines)
+  ⎿  Read debug_val_single.py (158 lines)
+  ⎿  Referenced file data_av2\av2_llm_dataset.py
+  ⎿  Read debug_masks.py (54 lines)
+  ⎿  Read debug_ckpt_keys.py (12 lines)
+
+❯ 经过查询和确认，SmolLM系列的模型所能接受的最大长度均为2048，无论是135M还是360 
+  M，但是我暂时不太想更换其他模型，我认为更换其他模型略微失去其中的意义。       
+
+● 好，那在 2048 token 硬限制下，目前有两条路：
+
+  路线 A：分离 Agent 编码（推荐，根本解决方案）
+  - 每个 agent 独立做一次 LLM forward pass（共享权重），自己用完 2048 token
+  - 6 个 agent 的 hidden representation 再通过 cross-attention 融合
+  - 彻底消除 token 竞争，每个 agent 都有 50 步完整历史
+  - 需要较大架构重构：修改 llm_motion_model.py 和 av2_llm_dataset.py
+
+  路线 B：压缩格式（临时方案）
+  - max_length 从 1500 改到 2048（+548 token）
+  - 步幅采样（每 2 步取 1 步）把每个 agent 压到 25 步
+  - 结果：focal 约 600 token，剩余 ~1300 token 分给 5 个邻居，每个约 11 步
+  - 实现简单，但邻居信息仍然严重不足
+
+  路线 B 的根本问题：即使再压缩，5 个邻居在单个序列里分到的 token
+  依然少得可怜（约 11 步），无法提供足够的上下文。而且 focal agent 的历史也从 50
+   步缩减到 25 步，精度下降。
+
+  结论：如果目标是让模型真正学会多智能体交互，路线 A 是唯一合理选择。路线 B
+  只能缓解截断问题，无法从根本上解决。
+
+  你想进行路线 A
+  的实现吗？如果是，我可以先给出架构设计和修改范围，确认后再动手写代码。
+
+✻ Baked for 21s
+
+❯ 我目前想尝试一下planA的方法，请给出设计思路。                                 
+
+● Plan A 架构设计：分离 Agent 编码
+
+  核心思路
+
+  旧架构：
+    [header + agent0 + agent1 + ... + agent5] → 单次 LLM → mask pooling → MLP
+    问题：共享 token budget，后面的 agent 被截断
+
+  新架构：
+    agent0 prompt → LLM ┐
+    agent1 prompt → LLM ├→ cross-attention → MLP → 轨迹
+    ...                 │
+    agent5 prompt → LLM ┘
+    优点：每个 agent 独享 2048 token，无截断
+
+  ---
+  数据层变化（av2_llm_dataset.py）
+
+  旧：构建一个长 prompt，所有 agent 拼接，输出 input_ids: [L]
+
+  新：为每个 agent 构建独立 prompt，输出 input_ids: [N, L]
+
+  每个 agent 的 prompt 格式：
+  [scene header]  # 时间、地点等静态信息，约 50 token
+  [该 agent 自身的 0~50 步历史]  # 约 1200 token（focal）或更短
+
+  - N 个 agent 各自独立 tokenize，统一 pad 到相同长度 L（≤ 2048）
+  - 删除 agent_token_masks（不再需要）
+  - agent_valid 改为：该 agent 是否存在于场景中（非零 mask）
+
+  ---
+  模型层变化（llm_motion_model.py）
+
+  forward(input_ids[B,N,L], attention_mask[B,N,L]):
+
+    1. Reshape → [B*N, L]
+    2. LLM encoder（共享权重）→ hidden [B*N, L, H]
+    3. Mean pool（或 [CLS] token）→ [B*N, H]
+    4. Reshape → [B, N, H]   ← 每个 agent 一个 representation
+    5. Social Cross-Attention: Q=K=V=[B,N,H] → [B,N,H]
+    6. MLP head → [B, N, K, 60, 2]（K 个预测模式）
+
+  Step 5 是核心新增模块，让 agent 之间能够"互相看见"，提供社交上下文。
+
+  ---
+  模块设计
+
+  ┌────────────────┬──────────────────────────────────────┬────────────────┐
+  │      模块      │                 描述                 │     参数量     │
+  ├────────────────┼──────────────────────────────────────┼────────────────┤
+  │ LLM Backbone   │ SmolLM-135M/360M，共享权重           │ 冻结 or        │
+  │                │                                      │ 部分解冻       │
+  ├────────────────┼──────────────────────────────────────┼────────────────┤
+  │ Agent Pooling  │ mean pool 或 CLS token               │ 0              │
+  ├────────────────┼──────────────────────────────────────┼────────────────┤
+  │ Social         │ 标准 Multi-Head                      │ ~4× H²         │
+  │ Attention      │ Attention，num_heads=4               │                │
+  ├────────────────┼──────────────────────────────────────┼────────────────┤
+  │ MLP Head       │ H → 256 → K×60×2                     │ 小             │
+  └────────────────┴──────────────────────────────────────┴────────────────┘
+
+  ---
+  内存/计算分析
+
+  - 每次 forward：B × N 个短序列（约 1300 token）并行通过 LLM
+  - 等效 batch size = B × N = 4 × 6 = 24（实际比旧架构更节省，因序列更短）
+  - Cross-attention 计算量：O(N² × H) 极小，N≤6 可忽略
+
+  ---
+  需要修改的文件
+
+  data_av2/av2_llm_dataset.py   ← 重写 prompt 构建逻辑，输出 [N, L]
+  simpl/llm_motion_model.py     ← 添加 social attention，修改 forward
+  train_llm.py                  ← 数据 shape 适配（通常改动很小）
+
+  ---
+  实现顺序建议
+
+  1. 先改 dataset：让 __getitem__ 输出 input_ids: [N, L]，验证 prompt 内容正确
+  2. 再改 model：添加 social cross-attention，调整 forward 签名
+  3. 验证：用 debug_masks.py 类似的脚本确认每个 agent 都有非零 token
+  4. 训练：从头训练（旧 checkpoint 不兼容）
+
+  ---
+  这个设计方向你认可吗？确认后我们从 Step 1（dataset 层）开始实现。
+
+✻ Churned for 43s
+
+❯ 好，现在你可以开始实现你的思路。请注意你需要告诉我你修改了什么，方便我后续进  
+  行追溯检查。                                                                  
+
+● 好，我先读取所有需要修改的文件，了解当前实现细节后再动手。
+
+  Read 2 files (ctrl+o to expand)
+
+● Now let me read the training script and loss file:
+
+  Read 2 files (ctrl+o to expand)
+
+● 好，我现在有足够的信息来实现完整的架构改动。下面按文件顺序进行修改。
+
+  ---
+  文件 1：data_av2/av2_llm_dataset.py
+
+  改动内容：
+  - __init__ 新增 max_len_per_agent 参数
+  - 新增 generate_per_agent_prompts() 方法（每个 agent 独立 prompt）
+  - __getitem__ 完全重写：改为对每个 agent 分别 tokenize，输出 input_ids: [N, L]
+  - 删除 agent_token_masks 输出键
+  - 保留原 generate_prompt() 不变（debug 脚本仍需要它）
+
+● Update(data_av2\av2_llm_dataset.py)
+  ⎿  Added 1 line, removed 1 line
+      12      and converts the numerical trajectory and lane graph data i
+          nto 
+      13      a highly semantic, instance-centric Language Model Prompt.
+      14      """
+      15 -    def __init__(self, data_dir, tokenizer_name="HuggingFaceTB/
+         -SmolLM-135M", obs_len=50, max_neighbors=5, max_lanes=10, traj_s
+         -tep=1):                                                        
+      15 +    def __init__(self, data_dir, tokenizer_name="HuggingFaceTB/
+         +SmolLM-135M", obs_len=50, max_neighbors=5, max_lanes=10, traj_s
+         +tep=1, max_len_per_agent=1500):                                
+      16          super().__init__()
+      17          self.data_dir = data_dir
+      18          # Search recursively to support both flat and subdirect
+          ory layouts
+
+● Update(data_av2\av2_llm_dataset.py)
+  ⎿  Added 1 line
+      27          self.max_neighbors = max_neighbors
+      28          self.max_lanes = max_lanes
+      29          self.traj_step = traj_step
+      30 +        self.max_len_per_agent = max_len_per_agent             
+      31  
+      32          if len(self.file_list) == 0:
+      33              raise FileNotFoundError(f"No .pkl files found under
+           {data_dir}. "
+
+● Now add the generate_per_agent_prompts method right before __getitem__:
+
+● Update(data_av2\av2_llm_dataset.py)
+  ⎿  Added 121 lines
+      383  
+      384          return prompt, agent_char_ranges, written_agent_ids
+      385  
+      386 +    def generate_per_agent_prompts(self, df_row):             
+      387 +        """                                                   
+      388 +        Build one independent prompt per agent (focal + up to 
+          +max_neighbors).                                               
+      389 +        Each prompt = shared scene header + that agent's own t
+          +rajectory segment.                                            
+      390 +        This avoids the single-sequence token-budget problem: 
+          +every agent gets                                              
+      391 +        its own full context window in the LLM.               
+      392 +                                                              
+      393 +        Returns:                                              
+      394 +            agent_prompts:     list of (prompt_str, traj_index
+          +) — one per written agent                                     
+      395 +            written_agent_ids: list of int — indices into traj
+          +s_pos / has_flags                                             
+      396 +        """                                                   
+      397 +        seq_id    = df_row["SEQ_ID"]                          
+      398 +        city_name = df_row["CITY_NAME"]                       
+      399 +        trajs     = df_row["TRAJS"]                           
+      400 +        lane_graph = df_row["LANE_GRAPH"]                     
+      401 +                                                              
+      402 +        trajs_pos = trajs["trajs_pos"]                        
+      403 +        trajs_vel = trajs["trajs_vel"]                        
+      404 +        has_flags = trajs["has_flags"]                        
+      405 +        trajs_cat = trajs["trajs_cat"]                        
+      406 +                                                              
+      407 +        fk = self._extract_focal_kinematics(trajs_pos, trajs_v
+          +el, has_flags, lane_graph)                                    
+      408 +                                                              
+      409 +        # Collect valid neighbors (same logic as generate_prom
+          +pt)                                                           
+      410 +        neighbors_info = []                                   
+      411 +        trajs_ctrs = trajs["trajs_ctrs"]                      
+      412 +        trajs_vecs = trajs["trajs_vecs"]                      
+      413 +        for i in range(1, len(trajs_cat)):                    
+      414 +            if has_flags[i, self.obs_len - 1]:                
+      415 +                ctr, vec = trajs_ctrs[i], trajs_vecs[i]       
+      416 +                theta   = np.arctan2(vec[1], vec[0])          
+      417 +                rot_mat = np.array([[np.cos(theta), -np.sin(th
+          +eta)],                                                        
+      418 +                                    [np.sin(theta),  np.cos(th
+          +eta)]])                                                       
+      419 +                pos_focal = trajs_pos[i, :self.obs_len, :].dot
+          +(rot_mat.T) + ctr                                             
+      420 +                vel_focal = trajs_vel[i, :self.obs_len, :].dot
+          +(rot_mat.T)                                                   
+      421 +                curr_pos   = pos_focal[-1]                    
+      422 +                curr_vel   = vel_focal[-1]                    
+      423 +                curr_speed = np.linalg.norm(curr_vel)         
+      424 +                raw_n_dict = {"curr_pos": curr_pos, "curr_vel"
+          +: curr_vel,                                                   
+      425 +                              "curr_speed": curr_speed, "vel_h
+          +ist": vel_focal,                                              
+      426 +                              "pos_hist": pos_focal, "flags": 
+          +has_flags[i, :self.obs_len]}                                  
+      427 +                semantic_role, influence_score, is_stationary 
+          += \                                                           
+      428 +                    self._extract_spatial_relations(raw_n_dict
+          +, fk["last_speed"])                                           
+      429 +                if influence_score <= 0 and "low influence" in
+          + semantic_role:                                               
+      430 +                    continue                                  
+      431 +                neighbors_info.append({                       
+      432 +                    "id": i, "cat": trajs_cat[i],             
+      433 +                    "pos_hist": pos_focal, "vel_hist": vel_foc
+          +al,                                                           
+      434 +                    "flags": has_flags[i, :self.obs_len],     
+      435 +                    "semantic_role": semantic_role,           
+      436 +                    "influence_score": influence_score,       
+      437 +                    "is_stationary": is_stationary,           
+      438 +                    "curr_pos": curr_pos,                     
+      439 +                    "curr_speed": curr_speed                  
+      440 +                })                                            
+      441 +                                                              
+      442 +        labels, intention, affordances = \                    
+      443 +            self._identify_scenarios_and_intention(fk, lane_gr
+          +aph, neighbors_info)                                          
+      444 +                                                              
+      445 +        # Shared scene header (identical for all agent prompts
+          +)                                                             
+      446 +        scene_header  = f"Scenario '{seq_id}' in {city_name}. 
+          +Task: High-Fidelity Motion Prediction.\n"                     
+      447 +        scene_header += f"[SCENARIO IDENTIFICATION]\nLabels: {
+          +', '.join(labels)}\n\n"                                       
+      448 +        scene_header += (f"[AFFORDANCE & INTENTION]\nFocal Age
+          +nt Intention: {intention}\n"                                  
+      449 +                         f"Map Affordance: {', '.join(affordan
+          +ces)}\n\n")                                                   
+      450 +        scene_header += "[AGENT HISTORY]\n"                   
+      451 +                                                              
+      452 +        # Focal agent segment                                 
+      453 +        focal_valid_vels = np.linalg.norm(                    
+      454 +            trajs_vel[0, :self.obs_len][has_flags[0, :self.obs
+          +_len]], axis=1)                                               
+      455 +        focal_is_stationary = focal_valid_vels.max() < 0.5 if 
+          +len(focal_valid_vels) > 0 else True                           
+      456 +                                                              
+      457 +        if focal_is_stationary:                               
+      458 +            pos = trajs_pos[0, 49] if has_flags[0, 49] else tr
+          +ajs_pos[0, 0]                                                 
+      459 +            focal_seg = (f"* Focal Agent [Host]: t=0~49 Statio
+          +nary at "                                                     
+      460 +                         f"({pos[0]:.1f}, {pos[1]:.1f})\n[PRED
+          +ICT]:")                                                       
+      461 +        else:                                                 
+      462 +            f_steps = []                                      
+      463 +            for t in range(0, self.obs_len, self.traj_step):  
+      464 +                if has_flags[0, t]:                           
+      465 +                    pos = trajs_pos[0, t]                     
+      466 +                    spd = np.linalg.norm(trajs_vel[0, t])     
+      467 +                    f_steps.append(f"t={t}:({pos[0]:.1f},{pos[
+          +1]:.1f})|V:{spd:.1f}m/s")                                     
+      468 +            focal_seg = f"* Focal Agent [Host]: {' -> '.join(f
+          +_steps)}\n[PREDICT]:"                                         
+      469 +                                                              
+      470 +        agent_prompts     = [(scene_header + focal_seg, 0)]   
+      471 +        written_agent_ids = [0]                               
+      472 +                                                              
+      473 +        # Neighbor segments (sorted by influence score, same f
+          +ilter as generate_prompt)                                     
+      474 +        neighbors_info.sort(key=lambda x: x["influence_score"]
+          +, reverse=True)                                               
+      475 +        n_count = 0                                           
+      476 +        for n in neighbors_info:                              
+      477 +            if n_count >= self.max_neighbors:                 
+      478 +                break                                         
+      479 +            if n["influence_score"] < 5 and "low influence" in
+          + n["semantic_role"] and n_count >= 2:                         
+      480 +                continue                                      
+      481 +                                                              
+      482 +            first_idx  = np.where(n["flags"])[0][0]           
+      483 +            start_note = f" (Entered scene at t={first_idx})" 
+          +if first_idx > 0 else ""                                      
+      484 +            agent_type = self._cat_name(n["cat"])             
+      485 +                                                              
+      486 +            if n["is_stationary"]:                            
+      487 +                t_range = f"t={first_idx}~49" if first_idx > 0
+          + else "t=0~49"                                                
+      488 +                nbr_seg = (f"- {agent_type} (Impact:{n['influe
+          +nce_score']:.0f}){start_note} "                               
+      489 +                           f"[{n['semantic_role']}]: {t_range}
+          + Stationary at "                                              
+      490 +                           f"({n['curr_pos'][0]:.1f}, {n['curr
+          +_pos'][1]:.1f})\n[PREDICT]:")                                 
+      491 +            else:                                             
+      492 +                n_steps = []                                  
+      493 +                for t in range(0, self.obs_len, self.traj_step
+          +):                                                            
+      494 +                    if n["flags"][t]:                         
+      495 +                        pos = n["pos_hist"][t]                
+      496 +                        spd = np.linalg.norm(n["vel_hist"][t])
+      497 +                        n_steps.append(f"t={t}:({pos[0]:.1f},{
+          +pos[1]:.1f})|V:{spd:.1f}m/s")                                 
+      498 +                nbr_seg = (f"- {agent_type} (Impact:{n['influe
+          +nce_score']:.0f}){start_note} "                               
+      499 +                           f"[{n['semantic_role']}]: {' -> '.j
+          +oin(n_steps)}\n[PREDICT]:")                                   
+      500 +                                                              
+      501 +            agent_prompts.append((scene_header + nbr_seg, n["i
+          +d"]))                                                         
+      502 +            written_agent_ids.append(n["id"])                 
+      503 +            n_count += 1                                      
+      504 +                                                              
+      505 +        return agent_prompts, written_agent_ids               
+      506 +                                                              
+      507      def __getitem__(self, idx):
+      508          file_path = self.file_list[idx]
+      509          df = pd.read_pickle(file_path)
+
+● Now replace the entire body of __getitem__:
+
+● Update(data_av2\av2_llm_dataset.py)
+  ⎿  Added 44 lines, removed 44 lines
+      509          df = pd.read_pickle(file_path)
+      510          row = df.iloc[0]
+      511  
+      512 -        prompt_text, agent_char_ranges, written_agent_ids = se
+          -lf.generate_prompt(row)                                       
+      512 +        # --- Plan A: per-agent separate prompts ---          
+      513 +        agent_prompts, written_agent_ids = self.generate_per_a
+          +gent_prompts(row)                                             
+      514  
+      514 -        encodings = self.tokenizer(                           
+      515 -            prompt_text, truncation=True, max_length=1500, pad
+          -ding="max_length",                                            
+      516 -            return_tensors="pt", return_offsets_mapping=True  
+      517 -        )                                                     
+      518 -        offset_mapping = encodings.pop("offset_mapping").squee
+          -ze(0)  # [SeqLen, 2]                                          
+      519 -        seq_len = offset_mapping.shape[0]                     
+      520 -        max_total = self.max_neighbors + 1  # focal + max neig
+          -hbors                                                         
+      515 +        max_total = self.max_neighbors + 1   # focal + up to m
+          +ax_neighbors                                                  
+      516 +        L = self.max_len_per_agent                            
+      517  
+      522 -        # Build per-agent token masks using character-to-token
+          - mapping                                                      
+      523 -        tok_starts = offset_mapping[:, 0]                     
+      524 -        tok_ends   = offset_mapping[:, 1]                     
+      525 -        not_special = ~((tok_starts == 0) & (tok_ends == 0))  
+          -# exclude BOS/EOS/padding                                     
+      518 +        all_input_ids      = []                               
+      519 +        all_attention_masks = []                              
+      520  
+      527 -        agent_token_masks = torch.zeros(max_total, seq_len, dt
+          -ype=torch.float32)                                            
+      528 -        for a_idx, (c_start, c_end) in enumerate(agent_char_ra
+          -nges):                                                        
+      529 -            overlap = (tok_ends > c_start) & (tok_starts < c_e
+          -nd)                                                           
+      530 -            agent_token_masks[a_idx] = (not_special & overlap)
+          -.float()                                                      
+      521 +        for prompt_text, _ in agent_prompts:                  
+      522 +            enc = self.tokenizer(                             
+      523 +                prompt_text, truncation=True, max_length=L,   
+      524 +                padding="max_length", return_tensors="pt"     
+      525 +            )                                                 
+      526 +            all_input_ids.append(enc["input_ids"].squeeze(0)) 
+          +       # [L]                                                  
+      527 +            all_attention_masks.append(enc["attention_mask"].s
+          +queeze(0))  # [L]                                             
+      528  
+      532 -        # GT trajectories and validity masks for all written a
+          -gents, padded to max_total                                    
+      529 +        # Pad missing agent slots with dummy tensors (attentio
+          +n_mask[0]=1 avoids                                            
+      530 +        # all-zero mask NaN in the LLM; agent_valid will be Fa
+          +lse for these slots)                                          
+      531 +        while len(all_input_ids) < max_total:                 
+      532 +            dummy_ids  = torch.zeros(L, dtype=torch.long)     
+      533 +            dummy_mask = torch.zeros(L, dtype=torch.long)     
+      534 +            dummy_mask[0] = 1  # at least one "valid" token to
+          + prevent softmax NaN                                          
+      535 +            all_input_ids.append(dummy_ids)                   
+      536 +            all_attention_masks.append(dummy_mask)            
+      537 +                                                              
+      538 +        input_ids      = torch.stack(all_input_ids[:max_total]
+          +)        # [N, L]                                             
+      539 +        attention_mask = torch.stack(all_attention_masks[:max_
+          +total])  # [N, L]                                             
+      540 +                                                              
+      541 +        # GT trajectories — same displacement logic as Exp2   
+      542          trajs_pos = row["TRAJS"]["trajs_pos"]
+      543          has_flags = row["TRAJS"]["has_flags"]
+      535 -        N_agents = len(written_agent_ids)                     
+      544  
+      545          gt_trajectories     = torch.zeros(max_total, 60, 2, dt
+           ype=torch.float32)
+      538 -        gt_abs_trajectories = torch.zeros(max_total, 60, 2, dt
+          -ype=torch.float32)  # [Exp2] absolute GT for val metrics      
+      539 -        gt_anchor           = torch.zeros(max_total, 2,  dtype
+          -=torch.float32)     # [Exp2] last valid obs pos (cumsum origin
+          -)                                                             
+      546 +        gt_abs_trajectories = torch.zeros(max_total, 60, 2, dt
+          +ype=torch.float32)                                            
+      547 +        gt_anchor           = torch.zeros(max_total, 2,  dtype
+          +=torch.float32)                                               
+      548          gt_masks            = torch.zeros(max_total, 60, dtype
+           =torch.bool)
+      549          agent_valid         = torch.zeros(max_total, dtype=tor
+           ch.bool)
+      550  
+      551          for a_idx, ag_id in enumerate(written_agent_ids):
+      544 -            # --- [Exp1] Absolute coordinate GT ---           
+      545 -            # gt_trajectories[a_idx] = torch.tensor(trajs_pos[
+          -ag_id, self.obs_len:, :], dtype=torch.float32)                
+      546 -            # gt_masks[a_idx]        = torch.tensor(has_flags[
+          -ag_id, self.obs_len:], dtype=torch.bool)                      
+      547 -            # agent_valid[a_idx]     = True                   
+      552 +            abs_pos = torch.tensor(trajs_pos[ag_id, self.obs_l
+          +en:, :], dtype=torch.float32)                                 
+      553 +            flags   = torch.tensor(has_flags[ag_id, self.obs_l
+          +en:],    dtype=torch.bool)                                    
+      554  
+      549 -            # --- [Exp2] Displacement GT: per-step (dx, dy) fr
+          -om previous valid position ---                                
+      550 -            abs_pos = torch.tensor(trajs_pos[ag_id, self.obs_l
+          -en:, :], dtype=torch.float32)  # [60, 2]                      
+      551 -            flags   = torch.tensor(has_flags[ag_id, self.obs_l
+          -en:],    dtype=torch.bool)      # [60]                        
+      552 -                                                              
+      553 -            # find the last valid observed position as the cum
+          -sum anchor                                                    
+      555              anchor_idx = self.obs_len - 1
+      556              while anchor_idx > 0 and not has_flags[ag_id, anch
+           or_idx]:
+      557                  anchor_idx -= 1
+      557 -            anchor = torch.tensor(trajs_pos[ag_id, anchor_idx]
+          -, dtype=torch.float32)  # [2]                                 
+      558 +            anchor = torch.tensor(trajs_pos[ag_id, anchor_idx]
+          +, dtype=torch.float32)                                        
+      559  
+      560              disp = torch.zeros(60, 2, dtype=torch.float32)
+      561              prev = anchor.clone()
+     ...
+      564                      disp[t] = abs_pos[t] - prev
+      565                      prev    = abs_pos[t]
+      566  
+      566 -            gt_trajectories[a_idx]     = disp     # displaceme
+          -nt GT (used for loss)                                         
+      567 -            gt_abs_trajectories[a_idx] = abs_pos  # absolute G
+          -T (used for val ADE/FDE)                                      
+      568 -            gt_anchor[a_idx]           = anchor   # anchor for
+          - reconstructing absolute from predicted displacements         
+      567 +            gt_trajectories[a_idx]     = disp                 
+      568 +            gt_abs_trajectories[a_idx] = abs_pos              
+      569 +            gt_anchor[a_idx]           = anchor               
+      570              gt_masks[a_idx]            = flags
+      570 -            # Only mark valid if this agent's tokens survived 
+          -sequence truncation                                           
+      571 -            agent_valid[a_idx]         = (agent_token_masks[a_
+          -idx].sum() > 0)                                               
+      571 +            # Valid: agent was written AND its prompt has real
+          + tokens (not a dummy slot)                                    
+      572 +            agent_valid[a_idx]         = (attention_mask[a_idx
+          +].sum() > 1)                                                  
+      573  
+      574          return {
+      574 -            "input_ids":           encodings["input_ids"].sque
+          -eze(0),       # [SeqLen]                                      
+      575 -            "attention_mask":      encodings["attention_mask"]
+          -.squeeze(0),  # [SeqLen]                                      
+      576 -            "prompt_text":         prompt_text,               
+      577 -            "agent_token_masks":   agent_token_masks,    # [ma
+          -x_total, SeqLen]                                              
+      578 -            "gt_trajectories":     gt_trajectories,      # [ma
+          -x_total, 60, 2] Exp2: displacements | Exp1: absolute          
+      579 -            "gt_abs_trajectories": gt_abs_trajectories,  # [ma
+          -x_total, 60, 2] [Exp2] absolute GT for val metrics            
+      580 -            "gt_anchor":           gt_anchor,             # [m
+          -ax_total, 2]     [Exp2] cumsum origin per agent               
+      581 -            "gt_masks":            gt_masks,              # [m
+          -ax_total, 60]                                                 
+      582 -            "agent_valid":         agent_valid,           # [m
+          -ax_total]                                                     
+      575 +            "input_ids":           input_ids,            # [N,
+          + L]  — per-agent sequences                                    
+      576 +            "attention_mask":      attention_mask,        # [N
+          +, L]                                                          
+      577 +            "prompt_text":         agent_prompts[0][0],  # str
+          +: focal agent prompt (for debug)                              
+      578 +            "gt_trajectories":     gt_trajectories,      # [N,
+          + 60, 2] displacement GT                                       
+      579 +            "gt_abs_trajectories": gt_abs_trajectories,  # [N,
+          + 60, 2] absolute GT                                           
+      580 +            "gt_anchor":           gt_anchor,             # [N
+          +, 2]                                                          
+      581 +            "gt_masks":            gt_masks,              # [N
+          +, 60]                                                         
+      582 +            "agent_valid":         agent_valid,           # [N
+          +]                                                             
+      583          }
+
+● ---
+  文件 2：simpl/llm_motion_model.py
+
+  改动内容：
+  - 新增 SocialAttention 类（multi-head attention + 残差 + LayerNorm）
+  - SmolLMMotionPredictor.__init__ 新增 self.social_attn
+  - forward 签名改为 (input_ids[B,N,L], attention_mask[B,N,L], agent_valid[B,N])
+  - forward 内部：reshape → LLM → mean pool → reshape → social attn → MLP
+  - 删除旧的 agent_token_masks 参数和 per-agent mask pooling 逻辑
+
+● Update(simpl\llm_motion_model.py)
+  ⎿  Added 100 lines, removed 82 lines
+        2  import torch.nn as nn
+        3  from transformers import AutoModel, AutoConfig
+        4  
+        5 +                                                              
+        6 +class SocialAttention(nn.Module):                             
+        7 +    """                                                       
+        8 +    Single-layer multi-head self-attention over agent represen
+          +tations.                                                      
+        9 +    Lets each agent attend to all other (valid) agents, provid
+          +ing social context                                            
+       10 +    after each agent has been independently encoded by the LLM
+          +.                                                             
+       11 +    """                                                       
+       12 +    def __init__(self, hidden_dim, num_heads=4, dropout=0.1): 
+       13 +        super().__init__()                                    
+       14 +        self.attn = nn.MultiheadAttention(hidden_dim, num_head
+          +s,                                                            
+       15 +                                          dropout=dropout, bat
+          +ch_first=True)                                                
+       16 +        self.norm = nn.LayerNorm(hidden_dim)                  
+       17 +                                                              
+       18 +    def forward(self, x, agent_valid):                        
+       19 +        """                                                   
+       20 +        x:           [B, N, H]                                
+       21 +        agent_valid: [B, N] bool — True = agent present, False
+          + = padding slot                                               
+       22 +        Returns:     [B, N, H]                                
+       23 +        """                                                   
+       24 +        # key_padding_mask: True means IGNORE that key positio
+          +n                                                             
+       25 +        key_padding_mask = ~agent_valid          # [B, N]     
+       26 +        out, _ = self.attn(x, x, x, key_padding_mask=key_paddi
+          +ng_mask)                                                      
+       27 +        return self.norm(x + out)                # residual + 
+          +LayerNorm                                                     
+       28 +                                                              
+       29 +                                                              
+       30  class SmolLMMotionPredictor(nn.Module):
+        6 -    def __init__(self,                                        
+        7 -                 model_name="HuggingFaceTB/SmolLM-135M",      
+        8 -                 num_future_steps=60,                         
+        9 -                 unfreeze_last_n_layers=2):                   
+       31 +    def __init__(self,                                        
+       32 +                 model_name="HuggingFaceTB/SmolLM-135M",      
+       33 +                 num_future_steps=60,                         
+       34 +                 unfreeze_last_n_layers=2,                    
+       35 +                 social_num_heads=4):                         
+       36          super().__init__()
+       11 -                                                              
+       37 +                                                              
+       38          self.num_future_steps = num_future_steps
+       13 -                                                              
+       14 -        # Load the base transformer model (without the causal 
+          -language modeling head)                                       
+       15 -        # We just want the deep hidden representations.       
+       39 +                                                              
+       40          self.config = AutoConfig.from_pretrained(model_name)
+       17 -        self.llm = AutoModel.from_pretrained(model_name)      
+       18 -                                                              
+       19 -        # ----------------------------------------------------
+          ------                                                         
+       20 -        # Freeze Strategy:                                    
+       21 -        # Freeze all embeddings and most of the transformer bl
+          -ocks,                                                         
+       22 -        # only keep the last few layers and LayerNorms trainab
+          -le.                                                           
+       23 -        # ----------------------------------------------------
+          ------                                                         
+       24 -                                                              
+       25 -        # 1. Freeze embeddings                                
+       41 +        self.llm    = AutoModel.from_pretrained(model_name)   
+       42 +                                                              
+       43 +        # Freeze strategy: embeddings frozen, last N transform
+          +er layers trainable                                           
+       44          for param in self.llm.embed_tokens.parameters():
+       45              param.requires_grad = False
+       28 -                                                              
+       29 -        # 2. Freeze all but the last N layers                 
+       30 -        num_layers = len(self.llm.layers)                     
+       46 +                                                              
+       47 +        num_layers    = len(self.llm.layers)                  
+       48          frozen_layers = num_layers - unfreeze_last_n_layers
+       32 -                                                              
+       49          for i, layer in enumerate(self.llm.layers):
+       34 -            if i < frozen_layers:                             
+       35 -                for param in layer.parameters():              
+       36 -                    param.requires_grad = False               
+       37 -            else:                                             
+       38 -                for param in layer.parameters():              
+       39 -                    param.requires_grad = True                
+       40 -                                                              
+       41 -        # Ensure final layer norm is trainable as it directly 
+          -precedes our MLP                                              
+       50 +            req = (i >= frozen_layers)                        
+       51 +            for param in layer.parameters():                  
+       52 +                param.requires_grad = req                     
+       53 +                                                              
+       54          for param in self.llm.norm.parameters():
+       55              param.requires_grad = True
+       56  
+       57          print(f"Loaded {model_name}.")
+       58          print(f"Total layers: {num_layers}. Frozen: {frozen_la
+           yers}, Trainable: {unfreeze_last_n_layers}.")
+       59  
+       48 -        # ----------------------------------------------------
+          ------                                                         
+       49 -        # MLP Prediction Head:                                
+       50 -        # Takes the LLM's representation of the scene and dire
+          -ctly                                                          
+       51 -        # outputs unnormalized future coordinates (x, y)      
+       52 -        # ----------------------------------------------------
+          ------                                                         
+       53 -        hidden_dim = self.config.hidden_size # Usually 576 for
+          - SmolLM-135M                                                  
+       54 -                                                              
+       60 +        hidden_dim = self.config.hidden_size  # 576 for SmolLM
+          +-135M                                                         
+       61 +                                                              
+       62 +        # Social cross-attention: agents attend to each other 
+          +after LLM encoding                                            
+       63 +        self.social_attn = SocialAttention(hidden_dim, num_hea
+          +ds=social_num_heads)                                          
+       64 +                                                              
+       65 +        # MLP prediction head                                 
+       66          self.mlp_head = nn.Sequential(
+       67              nn.Linear(hidden_dim, 512),
+       68              nn.GELU(),
+       69              nn.Dropout(0.1),
+       70              nn.Linear(512, 256),
+       71              nn.GELU(),
+       61 -            nn.Linear(256, num_future_steps * 2) # [60 timeste
+          -ps * 2 (x,y)]                                                 
+       72 +            nn.Linear(256, num_future_steps * 2),             
+       73          )
+       74  
+       64 -    def forward(self, input_ids, attention_mask, agent_token_m
+          -asks):                                                        
+       75 +    def forward(self, input_ids, attention_mask, agent_valid):
+       76          """
+       77 +        Plan A: each agent has its own independent token seque
+          +nce.                                                          
+       78 +        The LLM is shared across all agents (weight-sharing). 
+       79 +        Social context is added via cross-attention after indi
+          +vidual encoding.                                              
+       80 +                                                              
+       81          Args:
+       67 -            input_ids:          [B, SeqLen]                   
+       68 -            attention_mask:     [B, SeqLen]  1 for real tokens
+          -, 0 for padding                                               
+       69 -            agent_token_masks:  [B, N_agents, SeqLen]  binary 
+          -mask selecting each agent's tokens                            
+       82 +            input_ids:      [B, N, L]  — per-agent token seque
+          +nces                                                          
+       83 +            attention_mask: [B, N, L]  — 1 for real tokens, 0 
+          +for padding                                                   
+       84 +            agent_valid:    [B, N]     — bool, True if agent e
+          +xists in scene                                                
+       85          Returns:
+       71 -            predicted_trajs: [B, N_agents, 60, 2]             
+       86 +            predicted_trajs: [B, N, 60, 2]                    
+       87          """
+       73 -        outputs = self.llm(input_ids=input_ids, attention_mask
+          -=attention_mask, output_hidden_states=False)                  
+       74 -        hidden_states = outputs.last_hidden_state  # [B, L, H]
+       88 +        B, N, L = input_ids.shape                             
+       89  
+       76 -        # --- v1: Global Mean Pooling (focal agent only, singl
+          -e output) ---                                                 
+       77 -        # mask = attention_mask.unsqueeze(-1).float()         
+          - # [B, L, 1]                                                  
+       78 -        # pooled = (hidden_states * mask).sum(dim=1) \        
+       79 -        #          / mask.sum(dim=1)                          
+          - # [B, H]                                                     
+       80 -        # pred_flat = self.mlp_head(pooled)                   
+          -# [B, num_future_steps*2]                                     
+       81 -        # predicted_trajs = pred_flat.view(B, self.num_future_
+          -steps, 2)  # [B, 60, 2]                                       
+       90 +        # Batch all N agents together for a single efficient L
+          +LM call                                                       
+       91 +        ids_flat  = input_ids.view(B * N, L)       # [B*N, L] 
+       92 +        mask_flat = attention_mask.view(B * N, L)   # [B*N, L]
+       93  
+       83 -        # --- v2: Per-Agent Token Pooling (all agents, structu
+          -red prompt) ---                                               
+       84 -        # For each agent, only pool the hidden states of token
+          -s belonging to that                                           
+       85 -        # agent's text segment (identified via tokenizer offse
+          -t_mapping in dataset).                                        
+       86 -        masks  = agent_token_masks.unsqueeze(-1)           # [
+          -B, N, L, 1]                                                   
+       87 -        pooled = (hidden_states.unsqueeze(1) * masks).sum(dim=
+          -2) \                                                          
+       88 -                 / masks.sum(dim=2).clamp(min=1e-9)        # [
+          -B, N, H]                                                      
+       94 +        outputs = self.llm(input_ids=ids_flat, attention_mask=
+          +mask_flat,                                                    
+       95 +                           output_hidden_states=False)        
+       96 +        hidden = outputs.last_hidden_state           # [B*N, L
+          +, H]                                                          
+       97 +        H = hidden.shape[-1]                                  
+       98  
+       90 -        B, N, H = pooled.shape                                
+       91 -        pred_flat = self.mlp_head(pooled.view(B * N, H))   # [
+          -B*N, num_future_steps*2]                                      
+       92 -        predicted_trajs = pred_flat.view(B, N, self.num_future
+          -_steps, 2) # [B, N_agents, 60, 2]                             
+       99 +        # Mean-pool over non-padding tokens to get one vector 
+          +per agent                                                     
+      100 +        mask_exp = mask_flat.unsqueeze(-1).float()            
+          +              # [B*N, L, 1]                                   
+      101 +        pooled   = (hidden * mask_exp).sum(dim=1) / \         
+      102 +                   mask_exp.sum(dim=1).clamp(min=1e-9)        
+          +              # [B*N, H]                                      
+      103  
+      104 +        agent_repr = pooled.view(B, N, H)                     
+          +              # [B, N, H]                                     
+      105 +                                                              
+      106 +        # Zero out invalid (dummy) agent slots before social a
+          +ttention                                                      
+      107 +        agent_repr = agent_repr * agent_valid.unsqueeze(-1).fl
+          +oat()         # [B, N, H]                                     
+      108 +                                                              
+      109 +        # Social cross-attention: each agent attends to all ot
+          +her valid agents                                              
+      110 +        agent_repr = self.social_attn(agent_repr, agent_valid)
+          +              # [B, N, H]                                     
+      111 +                                                              
+      112 +        # MLP head: predict future displacements for every age
+          +nt                                                            
+      113 +        pred_flat       = self.mlp_head(agent_repr.view(B * N,
+          + H))         # [B*N, 60*2]                                    
+      114 +        predicted_trajs = pred_flat.view(B, N, self.num_future
+          +_steps, 2)   # [B, N, 60, 2]                                  
+      115 +                                                              
+      116          return predicted_trajs
+      117  
+      118 +                                                              
+      119  # --- Quick Local Test ---
+      120  if __name__ == "__main__":
+       98 -    # Create dummy data simulating batch size 2, max seq len 1
+          -0                                                             
+       99 -    dummy_input_ids = torch.randint(0, 49000, (2, 50))        
+      100 -    dummy_attention_mask = torch.ones((2, 50), dtype=torch.lon
+          -g)                                                            
+      101 -    dummy_attention_mask[0, 40:] = 0 # Simulate right-padding 
+          -for the first sequence                                        
+      102 -                                                              
+      103 -    print("Initializing Model...")                            
+      104 -    model = SmolLMMotionPredictor(model_name="HuggingFaceTB/Sm
+          -olLM-135M", unfreeze_last_n_layers=2)                         
+      105 -                                                              
+      106 -    print("\nCounting trainable parameters:")                 
+      107 -    trainable_params = sum(p.numel() for p in model.parameters
+          -() if p.requires_grad)                                        
+      108 -    frozen_params = sum(p.numel() for p in model.parameters() 
+          -if not p.requires_grad)                                       
+      109 -    print(f"Trainable Params: {trainable_params:,}")          
+      110 -    print(f"Frozen Params: {frozen_params:,}")                
+      111 -                                                              
+      112 -    print("\nRunning Forward Pass...")                        
+      113 -    # v1 test: out = model(dummy_input_ids, dummy_attention_ma
+          -sk)                                                           
+      114 -    # v2 test: per-agent token masks — 6 agents (focal + 5 nei
+          -ghbors)                                                       
+      121      N_agents = 6
+      116 -    dummy_agent_masks = torch.zeros(2, N_agents, 50)          
+      117 -    dummy_agent_masks[:, 0, 5:15]  = 1.0  # focal agent tokens
+      118 -    dummy_agent_masks[:, 1, 15:25] = 1.0  # neighbor 1 tokens 
+      119 -    dummy_agent_masks[:, 2, 25:35] = 1.0  # neighbor 2 tokens 
+      120 -    out = model(dummy_input_ids, dummy_attention_mask, dummy_a
+          -gent_masks)                                                   
+      122 +    B, L     = 2, 128                                         
+      123  
+      124 +    dummy_input_ids = torch.randint(0, 49000, (B, N_agents, L)
+          +)                                                             
+      125 +    dummy_attn_mask = torch.ones((B, N_agents, L), dtype=torch
+          +.long)                                                        
+      126 +    dummy_attn_mask[0, -1, 10:] = 0   # simulate a short last-
+          +agent sequence                                                
+      127 +    dummy_agent_valid = torch.ones(B, N_agents, dtype=torch.bo
+          +ol)                                                           
+      128 +    dummy_agent_valid[0, -1] = False   # last agent slot empty
+          + in first sample                                              
+      129 +                                                              
+      130 +    print("Initializing Model (Plan A — separate agent encodin
+          +g)...")                                                       
+      131 +    model = SmolLMMotionPredictor(model_name="HuggingFaceTB/Sm
+          +olLM-135M",                                                   
+      132 +                                   unfreeze_last_n_layers=2)  
+      133 +                                                              
+      134 +    trainable = sum(p.numel() for p in model.parameters() if p
+          +.requires_grad)                                               
+      135 +    total     = sum(p.numel() for p in model.parameters())    
+      136 +    print(f"Trainable: {trainable:,} / Total: {total:,}")     
+      137 +                                                              
+      138 +    print("Running forward pass...")                          
+      139 +    out = model(dummy_input_ids, dummy_attn_mask, dummy_agent_
+          +valid)                                                        
+      140      print(f"Output shape: {out.shape}")
+      123 -    assert out.shape == (2, N_agents, 60, 2), "Output geometry
+          - is incorrect."                                               
+      141 +    assert out.shape == (B, N_agents, 60, 2), "Output geometry
+          + is incorrect."                                               
+      142      print("Forward pass successful!")
+
+● ---
+  文件 3：train_llm.py
+
+  改动内容：
+  - 训练循环：删除 agent_token_masks 的加载和传递，改为传递 agent_valid
+  - 验证循环：同上
+  - 仅涉及两处 model(...) 调用和对应的 .to(device) 行
+
+● Update(train_llm.py)  ⎿  Added 4 lines, removed 4 lines
+      223                      desc=f"[Train ep {epoch + 1}]")
+      224  
+      225          for i, data in enumerate(pbar):
+      226 -            input_ids = data["input_ids"].to(device)          
+      227 -            attention_mask = data["attention_mask"].to(device)
+      228 -            agent_token_masks = data["agent_token_masks"].to(d
+          -evice)                                                        
+      226 +            input_ids      = data["input_ids"].to(device)     
+          +  # [B, N, L]                                                 
+      227 +            attention_mask = data["attention_mask"].to(device)
+          +   # [B, N, L]                                                
+      228 +            agent_valid    = data["agent_valid"].to(device)   
+          +   # [B, N]                                                   
+      229  
+      230              optimizer.zero_grad()
+      231  
+      232              with torch.amp.autocast("cuda"):
+      233 -                predicted_trajs = model(input_ids, attention_m
+          -ask, agent_token_masks)                                       
+      233 +                predicted_trajs = model(input_ids, attention_m
+          +ask, agent_valid)                                             
+      234                  loss_out = loss_fn(predicted_trajs, data)
+      235  
+      236              loss = loss_out["loss"]
+
+● Update(train_llm.py)
+  ⎿  Added 4 lines, removed 4 lines
+      308  
+      309              with torch.no_grad():
+      310                  for i, data in enumerate(val_pbar):
+      311 -                    input_ids = data["input_ids"].to(device)  
+      312 -                    attention_mask = data["attention_mask"].to
+          -(device)                                                      
+      313 -                    agent_token_masks = data["agent_token_mask
+          -s"].to(device)                                                
+      311 +                    input_ids      = data["input_ids"].to(devi
+          +ce)       # [B, N, L]                                         
+      312 +                    attention_mask = data["attention_mask"].to
+          +(device)   # [B, N, L]                                        
+      313 +                    agent_valid    = data["agent_valid"].to(de
+          +vice)      # [B, N]                                           
+      314  
+      315                      with torch.amp.autocast("cuda"):
+      316 -                        predicted_trajs = model(input_ids, att
+          -ention_mask, agent_token_masks)                               
+      316 +                        predicted_trajs = model(input_ids, att
+          +ention_mask, agent_valid)                                     
+      317                          loss_out = loss_fn(predicted_trajs, da
+           ta)
+      318  
+      319                      val_loss_meter.update({k: v.item() for k, 
+           v in loss_out.items()})
+
+● ---
+  文件 4：debug_val_single.py
+
+  改动内容：
+  - 删除 agent_masks / agent_token_masks 的加载
+  - 改为传递 agent_valid 给模型
+  - input_ids 和 attention_mask 形状现在是 [1, N, L]，不需要额外调整（to_batch
+  已经处理）
+
+● Update(debug_val_single.py)
+  ⎿  Added 4 lines, removed 4 lines
+      65  print("  Model loaded.\n")
+      66  
+      67  # ── 4. Forward pass ──────────────────────────────────────────
+          ───────────────
+      68 -input_ids      = batch["input_ids"].to(DEVICE)                 
+      69 -attention_mask = batch["attention_mask"].to(DEVICE)            
+      70 -agent_masks    = batch["agent_token_masks"].to(DEVICE)         
+      68 +input_ids      = batch["input_ids"].to(DEVICE)      # [1, N, L]
+      69 +attention_mask = batch["attention_mask"].to(DEVICE)  # [1, N, L
+         +]                                                              
+      70 +agent_valid    = batch["agent_valid"].to(DEVICE)     # [1, N]  
+      71  
+      72  with torch.no_grad():
+      73 -    pred_disp = model(input_ids, attention_mask, agent_masks)  
+         -# [1, N, 60, 2]                                                
+      73 +    pred_disp = model(input_ids, attention_mask, agent_valid)  
+         +# [1, N, 60, 2]                                                
+      74  
+      75  pred_disp = pred_disp.float().cpu()  # [1, N, 60, 2]
+      76  
+
+● ---
+  现在快速验证一下所有改动没有明显的语法问题：
+
+● Bash("C:\Users\Ashley_Sun\anaconda3\envs\dl\python.exe" -c "
+      import sys…)
+  ⎿  OK  av2_llm_dataset.py
+     OK  llm_motion_model.py
+     OK  train_llm.py
+     OK  debug_val_single.py
+
+● 全部通过。下面是完整的改动总结：
+
+  ---
+  改动总结（供追溯）
+
+  data_av2/av2_llm_dataset.py
+
+  位置: __init__ 参数
+  改动: 新增 max_len_per_agent=1500
+  ────────────────────────────────────────
+  位置: __init__ 方法体
+  改动: 保存 self.max_len_per_agent
+  ────────────────────────────────────────
+  位置: 新增方法 generate_per_agent_prompts()
+  改动: 从原 generate_prompt() 的逻辑拆分出来：先构建共享 scene header，再为每个
+
+    agent（focal + 邻居）生成独立 prompt 字符串，返回 (prompt_str, traj_id) 列表
+  ────────────────────────────────────────
+  位置: __getitem__
+  改动: 完全重写：调用 generate_per_agent_prompts，对每个 agent 单独
+    tokenize，输出 input_ids: [N, L] 和 attention_mask: [N, L]；空 slot 填 dummy
+
+    张量（防止全零 mask 导致 softmax NaN）；删除 agent_token_masks 输出键
+  ────────────────────────────────────────
+  位置: generate_prompt()
+  改动: 未改动（debug 脚本仍可用）
+
+  simpl/llm_motion_model.py
+
+  位置: 新增类 SocialAttention
+  改动: nn.MultiheadAttention + 残差 + LayerNorm，接受 agent_valid 作为
+    key_padding_mask
+  ────────────────────────────────────────
+  位置: SmolLMMotionPredictor.__init__
+  改动: 新增 social_num_heads 参数；新增 self.social_attn = 
+    SocialAttention(...)；冻结策略不变
+  ────────────────────────────────────────
+  位置: forward 签名
+  改动: (input_ids, attention_mask, agent_token_masks) → (input_ids[B,N,L], 
+    attention_mask[B,N,L], agent_valid[B,N])
+  ────────────────────────────────────────
+  位置: forward 内部逻辑
+  改动: 旧：单次 LLM + mask pooling。新：reshape [B,N,L]→[B*N,L] → LLM → mean
+    pool → reshape [B,N,H] → zero 无效 agent → social attention → MLP
+
+  train_llm.py
+
+  ┌────────────────────┬────────────────────────────────────────────────────┐
+  │        位置        │                        改动                        │
+  ├────────────────────┼────────────────────────────────────────────────────┤
+  │ 训练循环（原第     │ 删除 agent_token_masks，改为 agent_valid =         │
+  │ 228-233 行）       │ data["agent_valid"].to(device) 并传入模型          │
+  ├────────────────────┼────────────────────────────────────────────────────┤
+  │ 验证循环（原第     │ 同上                                               │
+  │ 310-316 行）       │                                                    │
+  └────────────────────┴────────────────────────────────────────────────────┘
+
+  debug_val_single.py
+
+  ┌─────────────┬───────────────────────────────────────────────────────────┐
+  │    位置     │                           改动                            │
+  ├─────────────┼───────────────────────────────────────────────────────────┤
+  │ Forward     │ 删除 agent_masks = batch["agent_token_masks"]，改为       │
+  │ pass 部分   │ agent_valid = batch["agent_valid"] 传入模型               │
+  └─────────────┴───────────────────────────────────────────────────────────┘
+
+  ---
+  旧 checkpoint（Exp2）与新架构不兼容（多了 social_attn 层），需要从头训练。训练
+  命令与之前相同，新架构会自动生效。唯一需要注意的是内存：每次 LLM forward 处理
+  B×N 个序列（batch_size=4 时为 24 个），建议先用 --train_batch_size 2
+  测试内存占用。
+
+✻ Sautéed for 8m 11s

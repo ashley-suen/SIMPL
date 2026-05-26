@@ -1,4 +1,3 @@
-import imp
 import os
 import random
 import argparse
@@ -82,8 +81,10 @@ def save_ckpt(net, opt, epoch, save_dir, filename):
     for key in state_dict.keys():
         state_dict[key] = state_dict[key].cpu()
 
+    opt_state = opt.opt.state_dict() if hasattr(opt, 'opt') else opt.state_dict()
+
     torch.save(
-        {"epoch": epoch, "state_dict": state_dict, "opt_state": opt.opt.state_dict()},
+        {"epoch": epoch, "state_dict": state_dict, "opt_state": opt_state},
         os.path.join(save_dir, filename),
     )
 

@@ -1,210 +1,679 @@
+"""
+Multi-GPU training script (DDP).  Structure mirrors train_llm.py exactly.
+Launch: torchrun --nproc_per_node=<N> train_ddp.py --features_dir data_av2/features ...
+
+DDP-only changes vs train_llm.py:
+  1. init_process_group / destroy_process_group
+  2. device = cuda:{local_rank}
+  3. Model wrapped with DDP; safe_save uses model.module
+  4. DataLoader uses DistributedSampler instead of shuffle=True
+  5. train_sampler.set_epoch(epoch) each epoch
+  6. Logging / saving / sanity checks only on rank 0
+  7. Validation metrics all_reduced across ranks before logging
+  8. dist.barrier() at epoch start and before/after validation to keep ranks in sync
+"""
 import os
-import sys
+import glob
 import time
-import copy
-import subprocess
-from typing import Any, Dict, List, Tuple, Union
-from datetime import datetime
 import argparse
-import faulthandler
+import datetime
+from datetime import datetime as dt
+from collections import deque
 from tqdm import tqdm
+
+import math
 import numpy as np
-#
 import torch
-from torch.utils.data import DataLoader
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-#
-from loader import Loader
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.optim import AdamW
+
+# Disable tokenizers parallelism warning
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+from data_av2.av2_llm_dataset import AV2PromptDataset
+from simpl.llm_motion_model import SmolLMMotionPredictor
+from simpl.av2_llm_loss import LLMMotionLoss
 from utils.logger import Logger
-from utils.utils import AverageMeterForDict
-from utils.utils import save_ckpt, set_seed, str2bool, distributed_mean
+from utils.utils import AverageMeterForDict, set_seed, save_ckpt, distributed_mean
 
 
-def parse_arguments() -> Any:
-    """Arguments for running the baseline.
-
-    Returns:
-        parsed arguments
-    """
+def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", default="train", type=str, help="Mode, train/val/test")
     parser.add_argument("--features_dir", required=True, default="", type=str, help="Path to the dataset")
-    parser.add_argument("--train_batch_size", type=int, default=16, help="Training batch size")
-    parser.add_argument("--val_batch_size", type=int, default=16, help="Val batch size")
+    parser.add_argument("--train_batch_size", type=int, default=4, help="Per-GPU training batch size")
+    parser.add_argument("--val_batch_size", type=int, default=4, help="Per-GPU val batch size")
     parser.add_argument("--train_epoches", type=int, default=10, help="Number of epoches for training")
-    parser.add_argument("--val_interval", type=int, default=5, help="Validation intervals")
-    parser.add_argument("--data_aug", action="store_true", help="Enable data augmentation")
+    parser.add_argument("--val_interval", type=int, default=1, help="Validation intervals")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--use_cuda", action="store_true", help="Use CUDA for acceleration")
     parser.add_argument("--logger_writer", action="store_true", help="Enable tensorboard")
-    parser.add_argument("--adv_cfg_path", required=True, default="", type=str)
-    parser.add_argument("--rank_metric", required=False, type=str, default="brier_fde_k", help="Ranking metric")
-    parser.add_argument("--resume", action="store_true", help="Resume training")
     parser.add_argument("--no_pbar", action="store_true", help="Hide progress bar")
-    parser.add_argument("--model_path", required=False, type=str, help="path to the saved model")
+
+    # LLM Specific Args
+    parser.add_argument("--llm_lr", type=float, default=1e-5, help="Learning rate for LLM layers")
+    parser.add_argument("--mlp_lr", type=float, default=1e-4, help="Learning rate for MLP head")
+    parser.add_argument("--unfreeze_layers", type=int, default=1, help="Number of LLM layers to unfreeze")
+
+    # Loss
+    parser.add_argument("--pos_loss_weight", type=float, default=1.0,
+                        help="[Exp2] Weight for position reconstruction loss. "
+                             "Set to 0.0 to disable (displacement-only, Exp1 behaviour).")
+
+    # LR Scheduler
+    parser.add_argument("--scheduler", type=str, default="cosine_warmup_restart",
+                        choices=["cosine", "cosine_restart", "cosine_warmup_restart"],
+                        help="LR scheduler: cosine | cosine_restart | cosine_warmup_restart "
+                             "(warmup at start of each cycle + non-zero floor)")
+    parser.add_argument("--T_0", type=int, default=20,
+                        help="Epochs per restart cycle")
+    parser.add_argument("--T_mult", type=int, default=1,
+                        help="[cosine_restart] Cycle length multiplier after each restart")
+    parser.add_argument("--warmup_epochs", type=int, default=2,
+                        help="[cosine_warmup_restart] Linear warmup epochs at start of each cycle")
+    parser.add_argument("--eta_min_ratio", type=float, default=0.1,
+                        help="[cosine_warmup_restart] LR floor as fraction of max LR (e.g. 0.1 = 10%%)")
+
+    # Logging frequency control
+    parser.add_argument("--print_interval", type=int, default=100,
+                        help="Print intermediate training stats every N iterations")
+    parser.add_argument("--running_window", type=int, default=50,
+                        help="Window size (in iters) for running average loss display")
+
+    # Saving control
+    parser.add_argument("--ckpt_dir", type=str, default="saved_models/",
+                        help="Directory to save checkpoints")
+    parser.add_argument("--save_last_every_epoch", action="store_true", default=True,
+                        help="Save a 'last' checkpoint at the end of every epoch")
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader worker processes (increase on multi-core servers)")
+
+    # Resume
+    parser.add_argument("--resume_from", type=str, default="",
+                        help="Path to checkpoint (.tar) to resume from")
+    parser.add_argument("--resume_epoch", type=int, default=0,
+                        help="Epoch index (1-based display) already completed in the checkpoint. "
+                             "Used to fast-forward the LR scheduler.")
+    parser.add_argument("--reset_optimizer", action="store_true",
+                        help="When resuming, load model weights only — skip optimizer state. "
+                             "Required when changing unfreeze_layers or other param-group structure.")
+    parser.add_argument("--num_modes", type=int, default=6,
+                        help="Number of prediction modes K (default=6). "
+                             "K=1 is single-modal (original behaviour). "
+                             "K>1 uses Winner-Takes-All training loss; "
+                             "minADE/minFDE take the best mode per sample.")
+    parser.add_argument("--wta_epsilon", type=float, default=0.2,
+                        help="Epsilon-greedy WTA: probability of selecting a random mode "
+                             "instead of the best mode during training. Prevents mode collapse "
+                             "when K>1. Set to 0.0 for pure WTA. Ignored during validation.")
+
+    # Gradient clipping
+    parser.add_argument("--grad_clip", type=float, default=1.0,
+                        help="Max gradient norm for clip_grad_norm_")
+
+    # Early stopping
+    parser.add_argument("--early_stop_patience", type=int, default=5,
+                        help="Stop after this many epochs with no minADE improvement. 0=disabled.")
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.001,
+                        help="Minimum minADE improvement (m) to count as progress for early stopping.")
+
+    # Sequence length
+    parser.add_argument("--max_seq_len", type=int, default=1536,
+                        help="Max token length per agent prompt (padding target). "
+                             "Audit shows actual max=1393 with traj_step=1, so 1536 is lossless.")
+
+    # torch.compile
+    parser.add_argument("--compile", action="store_true",
+                        help="Wrap model with torch.compile after DDP for extra speed. "
+                             "First iteration will be slow (3-10 min compilation).")
+
     return parser.parse_args()
 
 
+def format_lr(optimizer):
+    """Format current LRs of each param group as a readable string."""
+    parts = []
+    names = ["llm", "social", "mlp"]
+    for i, pg in enumerate(optimizer.param_groups):
+        name = names[i] if i < len(names) else f"g{i}"
+        parts.append(f"{name}_lr={pg['lr']:.2e}")
+    return ", ".join(parts)
+
+
+def count_trainable_params(model):
+    """Return (trainable, total) parameter counts."""
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    return trainable, total
+
+
+def safe_save(logger, model, optimizer, epoch, dirpath, name):
+    """Wrap save_ckpt so a failure can never silently swallow our checkpoint."""
+    try:
+        # DDP wraps the model; unwrap to get the original state_dict
+        raw_model = model.module if isinstance(model, DDP) else model
+        save_ckpt(raw_model, optimizer, epoch, dirpath, name)
+        full_path = os.path.join(dirpath, name)
+        if os.path.exists(full_path):
+            size_mb = os.path.getsize(full_path) / (1024 ** 2)
+            logger.print(f'  >> Saved checkpoint: {full_path} ({size_mb:.1f} MB)')
+        else:
+            logger.print(f'  !! save_ckpt returned without error but file missing: {full_path}')
+        return True
+    except Exception as e:
+        logger.print(f'  !! save_ckpt FAILED for {name}: {type(e).__name__}: {e}')
+        return False
+
+
 def main():
-    args = parse_arguments()
-    faulthandler.enable()
-    start_time = time.time()
-
-    local_rank = int(os.environ['LOCAL_RANK'])
-    set_seed(args.seed + local_rank)
-
+    # ------ DDP initialisation ------
+    local_rank  = int(os.environ["LOCAL_RANK"])
+    global_rank = int(os.environ.get("RANK", "0"))
+    world_size  = int(os.environ.get("WORLD_SIZE", "1"))
+    
+    # Set device BEFORE init_process_group to avoid NCCL warnings
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend='nccl')
-    device = torch.device("cuda", local_rank)
-    world_size = dist.get_world_size()
+    device = torch.device(f"cuda:{local_rank}")
+    
+    is_main = (global_rank == 0)
+    # --------------------------------
 
-    is_main = True if local_rank == 0 else False
+    args = parse_arguments()
+    set_seed(args.seed + global_rank)   # unique seed per rank for data diversity
 
-    date_str = datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_dir = "log/" + date_str
+    date_str = dt.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = "log/" + date_str + "_llm_ddp"
+
+    # Logger: pass enable=is_main so non-main ranks produce no output/files
     logger = Logger(date_str=date_str, enable=is_main, log_dir=log_dir,
-                    enable_flags={'writer': args.logger_writer, 'mailbot': False})
-    logger.print(args)
-    # log basic info
-    logger.log_basics(args=args, datetime=date_str)
+                    enable_flags={'writer': args.logger_writer})
 
-    loader = Loader(args, device, is_ddp=True, world_size=world_size, local_rank=local_rank, verbose=is_main)
-    if args.resume:
-        logger.print('[Resume] Loading state_dict from {}'.format(args.model_path))
-        loader.set_resmue(args.model_path)
-    (train_set, val_set), net, loss_fn, optimizer, evaluator = loader.load()
+    # RTX 5090 (Blackwell sm_120) is incompatible with PyTorch 2.7 NCCL in multi-process DDP.
+    # NCCL does not raise an exception — it silently hangs, so try/except cannot catch it.
+    # Gloo overhead is negligible: 5.3M trainable params = ~10.6 MB gradient, ~0.4 ms per sync.
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "eth0")
+    os.environ.setdefault("GLOO_DEVICE_TRANSPORT", "TCP")
+    os.environ.setdefault("GLOO_SOCKET_NTHREADS", "8")
+    dist.init_process_group(backend="gloo", timeout=datetime.timedelta(minutes=10))
+    logger.print(f"Using Gloo backend | world_size={world_size} | rank={global_rank}")
 
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_set)
-    dl_train = DataLoader(train_set,
-                          batch_size=args.train_batch_size,
-                          num_workers=48,
-                          collate_fn=train_set.collate_fn,
-                          drop_last=True,
-                          sampler=train_sampler,
-                          pin_memory=True)
+    if is_main:
+        logger.log_basics(args=args, datetime=date_str)
+        logger.print(f"DDP world_size={world_size} | "
+                     f"per-GPU batch={args.train_batch_size} | "
+                     f"total effective batch={args.train_batch_size * world_size}")
 
-    val_sampler = torch.utils.data.distributed.DistributedSampler(val_set)
-    dl_val = DataLoader(val_set,
-                        batch_size=args.val_batch_size,
-                        num_workers=48,
-                        collate_fn=val_set.collate_fn,
-                        drop_last=True,
-                        sampler=val_sampler,
-                        pin_memory=True)
+        # ------ Sanity checks for saving (FAIL FAST instead of after 26 minutes) ------
+        os.makedirs(args.ckpt_dir, exist_ok=True)
+        probe = os.path.join(args.ckpt_dir, f".write_probe_{date_str}")
+        try:
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+        except Exception as e:
+            raise RuntimeError(
+                f"Cannot write to ckpt_dir={args.ckpt_dir!r}: {type(e).__name__}: {e}. "
+                f"Aborting before training starts."
+            )
+        if args.val_interval > args.train_epoches:
+            raise ValueError(
+                f"val_interval ({args.val_interval}) > train_epoches ({args.train_epoches}); "
+                f"validation and best-checkpoint saving would never trigger."
+            )
+        logger.print(f"Checkpoints will be saved to: {os.path.abspath(args.ckpt_dir)}")
 
-    niter = 0
-    best_metric = 1e6
-    rank_metric = args.rank_metric
-    net_name = loader.network_name()
+    # 1. Dataset & DataLoader
+    train_dir = os.path.join(args.features_dir, 'train')
+    val_dir = os.path.join(args.features_dir, 'val')
 
-    for epoch in range(args.train_epoches):
-        dist.barrier()  # sync
-        logger.print('\nEpoch {}'.format(epoch))
+    logger.print(f"Loading datasets from {train_dir} and {val_dir}...")
+    train_set = AV2PromptDataset(train_dir, max_len_per_agent=args.max_seq_len)
+    val_set   = AV2PromptDataset(val_dir,   max_len_per_agent=args.max_seq_len)
+    logger.print(f"Train samples: {len(train_set)} | Val samples: {len(val_set)} "
+                 f"| max_seq_len={args.max_seq_len}")
+
+    if is_main and len(val_set) == 0:
+        raise RuntimeError(
+            f"Validation set is empty (path={val_dir}). "
+            f"Best-checkpoint logic cannot work — aborting."
+        )
+
+    # DDP: DistributedSampler replaces shuffle=True
+    train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=global_rank, shuffle=True)
+    val_sampler   = DistributedSampler(val_set,   num_replicas=world_size, rank=global_rank, shuffle=False)
+
+    # persistent_workers requires num_workers > 0
+    persistent = args.num_workers > 0
+    dl_train = DataLoader(train_set, batch_size=args.train_batch_size, sampler=train_sampler,
+                          num_workers=args.num_workers, pin_memory=True,
+                          persistent_workers=persistent)
+    dl_val   = DataLoader(val_set,   batch_size=args.val_batch_size,   sampler=val_sampler,
+                          num_workers=args.num_workers, pin_memory=True,
+                          persistent_workers=persistent)
+
+    iters_per_epoch = len(dl_train)
+    val_iters = len(dl_val)
+    logger.print(f"Iterations per epoch (per GPU): train={iters_per_epoch}, val={val_iters}")
+
+    # flash-attn custom CUDA kernels conflict with NCCL's memory on RTX 5090 (Blackwell/sm_120)
+    # regardless of backend — always use sdpa in DDP context.
+    use_flash_attn = False
+    logger.print("Flash Attention 2: Disabled (using SDPA — flash-attn conflicts with DDP on sm_120)")
+    
+    # DDP workaround: use file-based synchronization to avoid concurrent model loading.
+    import time
+    lock_file = "/tmp/simpl_ddp_model_load.lock"
+    
+    if global_rank == 0:
+        # Rank 0: create lock, load model, then remove lock
+        with open(lock_file, 'w') as f:
+            f.write(str(os.getpid()))
+        
+        model = SmolLMMotionPredictor(
+            unfreeze_last_n_layers=args.unfreeze_layers,
+            num_modes=args.num_modes,
+            device=None,
+            use_flash_attn=use_flash_attn,
+            dtype=torch.bfloat16,
+        )
+        model = model.to(device).to(torch.bfloat16)
+        if os.path.exists(lock_file):
+            os.remove(lock_file)
+    else:
+        max_wait = 300
+        waited = 0
+        while os.path.exists(lock_file) and waited < max_wait:
+            time.sleep(0.5)
+            waited += 0.5
+        if waited >= max_wait:
+            raise RuntimeError(f"Rank {global_rank} timed out waiting for rank 0 to load model")
+        time.sleep(1)
+        model = SmolLMMotionPredictor(
+            unfreeze_last_n_layers=args.unfreeze_layers,
+            num_modes=args.num_modes,
+            device=None,
+            use_flash_attn=use_flash_attn,
+            dtype=torch.bfloat16,
+        )
+        model = model.to(device).to(torch.bfloat16)
+    
+    dist.barrier()
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+    if args.compile:
+        model = torch.compile(model, mode="reduce-overhead")
+        logger.print("torch.compile enabled (mode=reduce-overhead) — first iter ~3-10 min")
+
+    loss_fn = LLMMotionLoss(device=device, pos_loss_weight=args.pos_loss_weight,
+                            wta_epsilon=args.wta_epsilon)
+    if is_main:
+        logger.print(f"Loss: disp_loss + {args.pos_loss_weight} × pos_loss "
+                     f"({'hybrid' if args.pos_loss_weight > 0 else 'displacement-only'}) | "
+                     f"WTA epsilon={args.wta_epsilon} ({'epsilon-greedy' if args.wta_epsilon > 0 else 'pure WTA'})")
+
+        n_trainable, n_total = count_trainable_params(model)
+        logger.print(f"Model params: trainable={n_trainable:,} / total={n_total:,} "
+                     f"({100.0 * n_trainable / max(n_total, 1):.2f}% trainable)")
+
+    # 3. Optimizer (Differential Learning Rates)
+    # DDP prefixes names with "module." — use substring match instead of startswith
+    llm_params    = [p for n, p in model.named_parameters() if p.requires_grad and "llm." in n]
+    mlp_params    = [p for n, p in model.named_parameters() if p.requires_grad and "mlp_head." in n]
+    social_params = [p for n, p in model.named_parameters() if p.requires_grad and "social_attn." in n]
+
+    if is_main:
+        logger.print(f"Trainable groups: llm_params={sum(p.numel() for p in llm_params):,}, "
+                     f"social_params={sum(p.numel() for p in social_params):,}, "
+                     f"mlp_params={sum(p.numel() for p in mlp_params):,}")
+
+    optimizer = AdamW([
+        {'params': llm_params,    'lr': args.llm_lr},
+        {'params': social_params, 'lr': args.mlp_lr},
+        {'params': mlp_params,    'lr': args.mlp_lr},
+    ], weight_decay=1e-4)
+
+    # --- LR Scheduler ---
+    if args.scheduler == "cosine_warmup_restart":
+        # Cosine decay with linear warmup at the start of each cycle and a non-zero LR floor.
+        # Within each T_0-epoch cycle:
+        #   [0, warmup_epochs)      : linear ramp from eta_min_ratio → 1.0
+        #   [warmup_epochs, T_0)    : cosine decay from 1.0 → eta_min_ratio
+        # This avoids the near-zero LR trough before each restart.
+        _T0   = args.T_0
+        _wu   = args.warmup_epochs
+        _r    = args.eta_min_ratio
+        def _lr_lambda(epoch):
+            cycle_pos = epoch % _T0
+            if cycle_pos < _wu:
+                return _r + (1.0 - _r) * cycle_pos / max(1, _wu)
+            progress = (cycle_pos - _wu) / max(1, _T0 - _wu)
+            return _r + (1.0 - _r) * 0.5 * (1.0 + math.cos(math.pi * progress))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+        if is_main:
+            logger.print(f"Scheduler: CosineWarmupRestart | T_0={_T0}, "
+                         f"warmup={_wu} epochs, eta_min_ratio={_r} "
+                         f"(floor={args.llm_lr * _r:.2e} for llm, "
+                         f"{args.mlp_lr * _r:.2e} for mlp)")
+    elif args.scheduler == "cosine_restart":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=args.T_0, T_mult=args.T_mult
+        )
+        if is_main:
+            logger.print(f"Scheduler: CosineAnnealingWarmRestarts | T_0={args.T_0}, T_mult={args.T_mult}")
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.train_epoches)
+        if is_main:
+            logger.print(f"Scheduler: CosineAnnealingLR | T_max={args.train_epoches}")
+
+    # 4. Resume from checkpoint (optional)
+    start_epoch = 0
+    if args.resume_from:
+        map_loc = {"cuda:0": f"cuda:{local_rank}"}
+        ckpt = torch.load(args.resume_from, map_location=map_loc)
+        raw_model = model.module if isinstance(model, DDP) else model
+        missing, unexpected = raw_model.load_state_dict(ckpt["state_dict"], strict=False)
+        if is_main and (missing or unexpected):
+            logger.print(f"  [Resume] strict=False: {len(missing)} missing keys, "
+                         f"{len(unexpected)} unexpected keys (expected when changing num_modes/architecture)")
+        if args.reset_optimizer:
+            if is_main:
+                logger.print("--reset_optimizer: skipping optimizer state load (fresh Adam states)")
+        else:
+            optimizer.load_state_dict(ckpt["opt_state"])
+            # Move optimizer states to the correct device (they are saved on CPU)
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
+        start_epoch = args.resume_epoch          # epochs already completed (1-based count)
+        # Fast-forward the scheduler to match the resumed epoch
+        for _ in range(start_epoch):
+            scheduler.step()
+        if is_main:
+            logger.print(f"Resumed from: {args.resume_from}")
+            logger.print(f"Continuing from epoch {start_epoch + 1} | "
+                         f"LR after fast-forward: {format_lr(optimizer)}")
+
+    # 5. Training Loop
+    niter = start_epoch * args.train_batch_size * world_size * len(dl_train)
+    best_val_loss = float('inf')
+    best_minADE   = float('inf')
+    patience_counter = 0
+    # Shared flag for early-stop broadcast: rank 0 sets it, all ranks read it
+    should_stop_flag = torch.zeros(1, dtype=torch.int32, device=device)
+    train_start = time.time()
+    last_ckpt_name = f'{date_str}_llm_simpl_last.tar'
+    best_ckpt_name = f'{date_str}_llm_simpl_best.tar'
+    saved_any = False
+
+    if is_main and args.early_stop_patience > 0:
+        logger.print(f"Early stopping: patience={args.early_stop_patience} epochs, "
+                     f"min_delta={args.early_stop_min_delta} m (monitored metric: minADE)")
+
+    for epoch in range(start_epoch, args.train_epoches):
+        # FIX: sync all ranks at the start of each epoch before any work begins
+        dist.barrier()
+
+        train_sampler.set_epoch(epoch)  # DDP: ensures different shuffle each epoch
+
+        if is_main:
+            logger.print('\n' + '=' * 80)
+            logger.print(f'Epoch {epoch + 1}/{args.train_epoches}')
+            logger.print(f'  - LR : {format_lr(optimizer)}')
+            logger.print(f'  - Batch size (per-GPU/total): {args.train_batch_size}/{args.train_batch_size * world_size}')
+            logger.print(f'  - GPUs                      : {world_size}')
+            logger.print(f'  - Unfrozen LLM layers       : {args.unfreeze_layers}')
+            logger.print(f'  - Prediction modes (K)      : {args.num_modes}')
+            logger.print(f'  - AMP (bf16)                : True (weights + autocast)')
+            logger.print(f'  - Grad clip max norm        : {args.grad_clip}')
+            logger.print(f'  - Max seq len               : {args.max_seq_len}')
+            logger.print(f'  - torch.compile             : {args.compile}')
+            logger.print('=' * 80)
+
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        # * Train
-        dl_train.sampler.set_epoch(epoch)
+        # --- TRAIN ---
         epoch_start = time.time()
         train_loss_meter = AverageMeterForDict()
-        train_eval_meter = AverageMeterForDict()
-        net.train()
-        for i, data in enumerate(tqdm(dl_train, disable=(not is_main) or args.no_pbar, ncols=80)):
-            data_in = net.module.pre_process(data)
-            out = net(data_in)
-            loss_out = loss_fn(out, data)
+        loss_window = deque(maxlen=args.running_window)
 
-            post_out = net.module.post_process(out)
-            eval_out = evaluator.evaluate(post_out, data)
+        model.train()
+
+        pbar = tqdm(dl_train, disable=(not is_main or args.no_pbar), ncols=110,
+                    desc=f"[Train ep {epoch + 1}]")
+
+        for i, data in enumerate(pbar):
+            input_ids      = data["input_ids"].to(device)       # [B, N, L]
+            attention_mask = data["attention_mask"].to(device)   # [B, N, L]
+            agent_valid    = data["agent_valid"].to(device)      # [B, N]
 
             optimizer.zero_grad()
-            loss_out['loss'].backward()
-            lr = optimizer.step()
 
-            train_loss_meter.update(loss_out)
-            train_eval_meter.update(eval_out)
-            niter += world_size * args.train_batch_size
-            logger.add_dict(loss_out, niter, prefix='train/')
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                predicted_trajs = model(input_ids, attention_mask, agent_valid)
+                loss_out = loss_fn(predicted_trajs, data)
 
-        # print('epoch: {}, lr: {}'.format(epoch, lr))
-        optimizer.step_scheduler()
+            loss = loss_out["loss"]
+
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+            optimizer.step()
+
+            scalar_losses = {k: v.item() for k, v in loss_out.items()}
+            train_loss_meter.update(scalar_losses)
+            loss_window.append(scalar_losses["loss"])
+
+            niter += args.train_batch_size * world_size
+            if is_main:
+                logger.add_dict(scalar_losses, niter, prefix='train/')
+
+            running_loss = sum(loss_window) / len(loss_window)
+            gnorm_val = grad_norm.item() if torch.is_tensor(grad_norm) else float(grad_norm)
+            postfix = {
+                "loss": f"{scalar_losses['loss']:.4f}",
+                f"loss_avg{len(loss_window)}": f"{running_loss:.4f}",
+                "gnorm": f"{gnorm_val:.2f}",
+            }
+            pbar.set_postfix(postfix)
+
+            if is_main and ((i + 1) % args.print_interval == 0 or (i + 1) == iters_per_epoch):
+                elapsed = time.time() - epoch_start
+                it_per_sec = (i + 1) / max(elapsed, 1e-6)
+                eta_sec = (iters_per_epoch - (i + 1)) / max(it_per_sec, 1e-6)
+                cur_mem = torch.cuda.memory_allocated(device=device) // 2 ** 20
+
+                extra_str = ""
+                for k, v in scalar_losses.items():
+                    if k == "loss":
+                        continue
+                    extra_str += f" | {k}={v:.4f}"
+
+                logger.print(
+                    f"  [ep {epoch + 1} | iter {i + 1}/{iters_per_epoch}] "
+                    f"loss={scalar_losses['loss']:.4f} "
+                    f"(run-avg={running_loss:.4f})"
+                    f"{extra_str} | "
+                    f"gnorm={gnorm_val:.2f} | "
+                    f"{it_per_sec:.2f} it/s | "
+                    f"eta={eta_sec / 60.0:.1f} min | "
+                    f"mem={cur_mem} MB"
+                )
+
+        pbar.close()
+        scheduler.step()
         max_memory = torch.cuda.max_memory_allocated(device=device) // 2 ** 20
-
         loss_avg = train_loss_meter.metrics['loss'].avg
-        logger.print('[Training] Avg. loss: {:.6}, time cost: {:.3} mins, lr: {:.3}, peak mem: {} MB'.
-                     format(loss_avg, (time.time() - epoch_start) / 60.0, lr, max_memory))
-        logger.print('-- ' + train_eval_meter.get_info())
-
-        logger.add_scalar('train/lr', lr, it=epoch)
-        logger.add_scalar('train/max_mem', max_memory, it=epoch)
-        for key, elem in train_eval_meter.metrics.items():
-            logger.add_scalar(title='train/{}'.format(key), value=elem.avg, it=epoch)
-
-        dist.barrier()  # sync
-        if ((epoch + 1) % args.val_interval == 0) or epoch > int(args.train_epoches / 2):
-            # * Validation
-            with torch.no_grad():
-                val_start = time.time()
-                dl_val.sampler.set_epoch(epoch)
-                val_loss_meter = AverageMeterForDict()
-                val_eval_meter = AverageMeterForDict()
-                net.eval()
-                for i, data in enumerate(tqdm(dl_val, disable=(not is_main) or args.no_pbar, ncols=80)):
-                    data_in = net.module.pre_process(data)
-                    out = net(data_in)
-                    loss_out = loss_fn(out, data)
-
-                    post_out = net.module.post_process(out)
-                    eval_out = evaluator.evaluate(post_out, data)
-
-                    val_loss_meter.update(loss_out)
-                    val_eval_meter.update(eval_out)
-
-                # make eval results into a Tensor
-                eval_res = [elem.avg for k, elem in val_eval_meter.metrics.items()]
-                eval_res = torch.from_numpy(np.array(eval_res)).to(device)
-
-                val_eval_mean = distributed_mean(eval_res)
-                val_eval = dict()
-                for i, key in enumerate(list(val_eval_meter.metrics.keys())):
-                    val_eval[key] = val_eval_mean[i].item()
-                val_eval_meter.reset()
-                val_eval_meter.update(val_eval)
-
-                logger.print('[Validation] Avg. loss: {:.6}, time cost: {:.3} mins'.format(
-                    val_loss_meter.metrics['loss'].avg, (time.time() - val_start) / 60.0))
-                logger.print('-- ' + val_eval_meter.get_info())
-
-                for key, elem in val_loss_meter.metrics.items():
-                    logger.add_scalar(title='val/{}'.format(key), value=elem.avg, it=epoch)
-                for key, elem in val_eval_meter.metrics.items():
-                    logger.add_scalar(title='val/{}'.format(key), value=elem.avg, it=epoch)
-
-                if is_main:
-                    if val_eval_meter.metrics[rank_metric].avg < best_metric:
-                        model_name = date_str + '_{}_ddp_best.tar'.format(net_name)
-                        save_ckpt(net.module, optimizer, epoch, 'saved_models/', model_name)
-                        best_metric = val_eval_meter.metrics[rank_metric].avg
-                        logger.print('Save the model: {}, {}: {:.4}, epoch: {}'.format(
-                            model_name, rank_metric, best_metric, epoch))
-
         if is_main:
-            if int(100 * epoch / args.train_epoches) in [20, 40, 60, 80] or (epoch > int(args.train_epoches * 0.8)):
-                model_name = date_str + '_{}_ddp_ckpt_epoch{}.tar'.format(net_name, epoch)
-                save_ckpt(net.module, optimizer, epoch, 'saved_models/', model_name)
-                logger.print('Save the model to {}'.format('saved_models/' + model_name))
+            logger.print(
+                f'[Training] Epoch {epoch + 1} done | avg loss: {loss_avg:.6f} | '
+                f'time: {(time.time() - epoch_start) / 60.0:.3f} mins | '
+                f'max mem: {max_memory} MB | next-epoch {format_lr(optimizer)}'
+            )
 
-    logger.print("\nTraining completed in {:.2f} mins".format((time.time() - start_time) / 60.0))
+        # ------ Always save a 'last' checkpoint, regardless of val ------
+        if is_main and args.save_last_every_epoch:
+            ok = safe_save(logger, model, optimizer, epoch, args.ckpt_dir, last_ckpt_name)
+            saved_any = saved_any or ok
 
+        # FIX: sync before validation so all ranks enter together
+        dist.barrier()
+
+        # --- VALIDATION ---
+        if (epoch + 1) % args.val_interval == 0:
+            val_start = time.time()
+            val_loss_meter = AverageMeterForDict()
+            ade_meter = AverageMeterForDict()
+            model.eval()
+
+            # FIX: set_epoch on val_sampler too, consistent with original
+            val_sampler.set_epoch(epoch)
+
+            val_pbar = tqdm(dl_val, disable=(not is_main or args.no_pbar), ncols=110,
+                            desc=f"[Val   ep {epoch + 1}]")
+
+            with torch.no_grad():
+                for i, data in enumerate(val_pbar):
+                    input_ids      = data["input_ids"].to(device)       # [B, N, L]
+                    attention_mask = data["attention_mask"].to(device)   # [B, N, L]
+                    agent_valid    = data["agent_valid"].to(device)      # [B, N]
+
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        predicted_trajs = model(input_ids, attention_mask, agent_valid)
+                        loss_out = loss_fn(predicted_trajs, data)
+
+                    val_loss_meter.update({k: v.item() for k, v in loss_out.items()})
+
+                    # minADE/minFDE: best mode over K for focal agent (index 0)
+                    # predicted_trajs: [B, N, K, T, 2]
+                    pred_disp_focal = predicted_trajs[:, 0].float()           # [B, K, T, 2]
+                    K_val           = pred_disp_focal.shape[1]
+                    anchor          = data["gt_anchor"][:, 0].to(device).float()             # [B, 2]
+                    # [B, K, T, 2]: cumsum per mode
+                    pred_abs_focal  = anchor.unsqueeze(1).unsqueeze(1) + \
+                                      pred_disp_focal.cumsum(dim=2)           # [B, K, T, 2]
+                    gt_focal        = data["gt_abs_trajectories"][:, 0].to(device).float()  # [B, T, 2]
+                    mask_focal      = data["gt_masks"][:, 0].to(device)                     # [B, T]
+                    B_val           = pred_abs_focal.shape[0]
+
+                    # L2 per mode per step: [B, K, T]
+                    l2_dist = (pred_abs_focal - gt_focal.unsqueeze(1)).norm(dim=-1)
+
+                    # minADE: min over K of mean-over-valid-steps L2
+                    valid_per_sample  = mask_focal.float().sum(dim=1).clamp(min=1)          # [B]
+                    per_mode_ade      = (l2_dist * mask_focal.unsqueeze(1).float()).sum(dim=2) \
+                                        / valid_per_sample.unsqueeze(1)                     # [B, K]
+                    min_ade           = per_mode_ade.min(dim=1).values.mean()
+
+                    # minFDE: min over K of L2 at last valid timestep
+                    last_valid_idx    = (mask_focal.long().cumsum(dim=1) *
+                                         mask_focal.long()).argmax(dim=1)                   # [B]
+                    idx_fde           = last_valid_idx.unsqueeze(1).unsqueeze(2) \
+                                        .expand(-1, K_val, 1)                               # [B, K, 1]
+                    per_mode_fde      = l2_dist.gather(2, idx_fde).squeeze(2)              # [B, K]
+                    min_fde           = per_mode_fde.min(dim=1).values.mean()
+
+                    ade_meter.update({"minADE": min_ade.item(), "minFDE": min_fde.item()})
+
+                    if is_main:
+                        val_pbar.set_postfix({
+                            "loss": f"{val_loss_meter.metrics['loss'].avg:.4f}",
+                            "minADE": f"{ade_meter.metrics['minADE'].avg:.4f}",
+                            "minFDE": f"{ade_meter.metrics['minFDE'].avg:.4f}",
+                        })
+
+            val_pbar.close()
+
+            # FIX: use distributed_mean (all_gather + mean) to aggregate metrics across ranks,
+            # matching the original's approach instead of the broken all_reduce+manual-divide.
+            metric_keys = ["loss", "minADE", "minFDE"]
+            local_vals = []
+            for key in metric_keys:
+                meter = val_loss_meter if key == "loss" else ade_meter
+                local_vals.append(meter.metrics[key].avg if key in meter.metrics else 0.0)
+
+            local_tensor = torch.tensor(local_vals, dtype=torch.float64, device=device)
+            global_mean  = distributed_mean(local_tensor)  # all_gather + mean across ranks
+
+            val_loss_avg = global_mean[0].item()
+            min_ade_avg  = global_mean[1].item()
+            min_fde_avg  = global_mean[2].item()
+
+            if is_main:
+                logger.print(
+                    f'[Validation] ep {epoch + 1} | loss: {val_loss_avg:.4f} | '
+                    f'minADE: {min_ade_avg:.4f} m | minFDE: {min_fde_avg:.4f} m | '
+                    f'time: {(time.time() - val_start) / 60.0:.3f} mins'
+                )
+                logger.add_scalar('val/loss',   val_loss_avg, it=epoch)
+                logger.add_scalar('val/minADE', min_ade_avg,  it=epoch)
+                logger.add_scalar('val/minFDE', min_fde_avg,  it=epoch)
+
+                # Best checkpoint criterion: minADE (lower is better)
+                ade_improved = min_ade_avg < best_minADE - args.early_stop_min_delta
+                if ade_improved:
+                    improvement = best_minADE - min_ade_avg
+                    best_minADE   = min_ade_avg
+                    best_val_loss = val_loss_avg   # keep for final summary
+                    patience_counter = 0
+                    logger.print(
+                        f'  >> minADE improved by {improvement:.4f} m → {best_minADE:.4f} m; '
+                        f'saving best checkpoint...'
+                    )
+                    ok = safe_save(logger, model, optimizer, epoch, args.ckpt_dir, best_ckpt_name)
+                    saved_any = saved_any or ok
+                else:
+                    patience_counter += 1
+                    remaining = (args.early_stop_patience - patience_counter
+                                 if args.early_stop_patience > 0 else -1)
+                    patience_str = (f' | patience {patience_counter}/{args.early_stop_patience}'
+                                    if args.early_stop_patience > 0 else '')
+                    logger.print(
+                        f'  -- No minADE improvement (best={best_minADE:.4f} m, '
+                        f'current={min_ade_avg:.4f} m){patience_str}'
+                    )
+                    if args.early_stop_patience > 0 and patience_counter >= args.early_stop_patience:
+                        logger.print(
+                            f'  !! Early stopping triggered: no improvement for '
+                            f'{patience_counter} consecutive epochs.'
+                        )
+                        should_stop_flag[0] = 1
+
+            # Broadcast early-stop signal from rank 0 to all ranks
+            dist.broadcast(should_stop_flag, src=0)
+
+            # FIX: sync after validation before next epoch starts
+            dist.barrier()
+
+            if should_stop_flag.item() == 1:
+                if is_main:
+                    logger.print(f"All ranks received early-stop signal — exiting training loop.")
+                break
+
+    # ------ Final summary ------
     if is_main:
-        # save trained model
-        model_name = date_str + '_{}_ddp_epoch{}.tar'.format(net_name, args.train_epoches)
-        save_ckpt(net.module, optimizer, epoch, 'saved_models/', model_name)
-        logger.print('Save the model to {}'.format('saved_models/' + model_name))
+        elapsed_min = (time.time() - train_start) / 60.0
+        logger.print(
+            f"\nTraining completed in {elapsed_min:.2f} mins | "
+            f"best minADE = {best_minADE:.4f} m | best val loss = {best_val_loss:.4f}"
+        )
+
+        saved_files = sorted(glob.glob(os.path.join(args.ckpt_dir, f'{date_str}_llm_simpl_*.tar')))
+        if not saved_files:
+            logger.print(
+                "!! WARNING: No checkpoint from this run was found on disk.\n"
+                f"   Looked in: {os.path.abspath(args.ckpt_dir)}\n"
+                f"   Pattern  : {date_str}_llm_simpl_*.tar\n"
+                "   Check the [Validation] / save_ckpt log lines above for errors."
+            )
+        else:
+            logger.print("Checkpoints written this run:")
+            for p in saved_files:
+                size_mb = os.path.getsize(p) / (1024 ** 2)
+                logger.print(f"  - {p} ({size_mb:.1f} MB)")
 
     dist.destroy_process_group()
-    logger.print('\nExit...\n')
 
 
 if __name__ == "__main__":

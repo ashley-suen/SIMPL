@@ -1,4 +1,3 @@
-import imp
 import os
 import subprocess
 import sys
@@ -7,7 +6,11 @@ import logging
 import torch
 import numpy as np
 #
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    _TENSORBOARD_AVAILABLE = True
+except ImportError:
+    _TENSORBOARD_AVAILABLE = False
 
 
 class Logger:
@@ -18,21 +21,30 @@ class Logger:
             self.enable_flags[k] = v and self.enable
 
         self.date_str = date_str
-        self.print('[Logger] {} - logger enable_flags: {}'.format(self.date_str, self.enable_flags))
 
         if log_dir == '':
             self.log_dir = "log/" + datetime.now().strftime("%Y%m%d-%H%M%S")
         else:
             self.log_dir = log_dir
 
-        if self.enable_flags['writer']:
-            self.writer = SummaryWriter(self.log_dir)
+        # Always write a plain-text log file, independent of TensorBoard.
+        os.makedirs("log", exist_ok=True)
+        log_filename = 'log/log_{}.log'.format(self.date_str)
+        for handler in logging.root.handlers[:]:
+            logging.root.removeHandler(handler)
+        logging.basicConfig(filename=log_filename,
+                            format='%(asctime)s:%(message)s', level=logging.INFO,
+                            filemode='a', datefmt='%Y-%m-%d %I:%M:%S')
 
-            filename = 'log/log_{}.log'.format(self.date_str)
-            for handler in logging.root.handlers[:]:
-                logging.root.removeHandler(handler)
-            logging.basicConfig(filename=filename,
-                                format='%(asctime)s:%(message)s', level=logging.INFO, filemode='a', datefmt='%Y-%m-%d %I:%M:%S')
+        self.print('[Logger] {} - logger enable_flags: {}'.format(self.date_str, self.enable_flags))
+        self.print('[Logger] Log file: {}'.format(os.path.abspath(log_filename)))
+
+        if self.enable_flags['writer']:
+            if not _TENSORBOARD_AVAILABLE:
+                print('[Logger] WARNING: tensorboard not installed, disabling writer.')
+                self.enable_flags['writer'] = False
+            else:
+                self.writer = SummaryWriter(self.log_dir)
 
     def log_basics(self, args, datetime):
         # log basic info

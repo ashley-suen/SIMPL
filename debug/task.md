@@ -1,0 +1,17 @@
+# Task Tracker
+- [x] Understand the structure of the generated `.pkl` files.
+- [x] Design a suitable LLM prompt template that maps numerical trajectories to text.
+- [x] Write a script to convert the `.pkl` data into prompt strings via a PyTorch Dataset class.
+- [x] Review extraction script with the user.
+- [x] Investigate why Neighbor Agent coordinates are near 0.
+- [x] Fix coordinate normalization logic in `av2_llm_dataset.py` if necessary.
+- [x] Improve Prompt template: Add semantic lane graph properties (Intersection, Lane Type).
+- [x] Improve Prompt template: Add explicit relative position/heading statements for Neighbor Agents.
+- [x] Comprehensive Prompt Enhancement: Add velocities of agents.
+- [x] Comprehensive Prompt Enhancement: Add lane boundaries (crossable/uncrossable) and topology (left/right neighbors).
+- [x] Investigate why neighbor velocities are V:0.0m/s and check other scenarios.
+- [x] Finalized Semantic Extraction Design (Scenario, Spatial Relations, Affordance).
+- [x] Execute rewriting `av2_llm_dataset.py` with multi-label scenario identification, semantic spatial roles (Instance-Centric), and Map Affordance.
+- [x] Verify the generated Advanced Prompts output.
+- [/] **Iteration**: Refine Neighbor Agents abstraction (`position`, `motion`, `interaction`) and filter out `low influence` nodes.
+- [ ] Build and verify the end-to-end SmolLM + MLP predictor architecture script (`llm_motion_model.py`).
