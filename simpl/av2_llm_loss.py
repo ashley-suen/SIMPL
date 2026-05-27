@@ -1,97 +1,84 @@
 import torch
 import torch.nn as nn
 
+
 class LLMMotionLoss(nn.Module):
-    def __init__(self, device, pos_loss_weight=1.0, wta_epsilon=0.2):
+    def __init__(self, device, soft_wta_alpha=0.1):
         """
-        pos_loss_weight: weight for cumulative position reconstruction loss.
-            Set to 0.0 to use displacement loss only.
-        wta_epsilon: probability of selecting a random mode instead of the best
-            mode during training (epsilon-greedy WTA). Prevents mode collapse
-            when K>1. Automatically disabled during validation (no_grad context).
-            Set to 0.0 to use pure WTA (not recommended for K>1).
+        soft_wta_alpha: weight for non-winner modes in soft WTA.
+            Winner mode always gets weight 1.0.
+            0.0 = hard WTA (not recommended for K>1, causes mode collapse).
         """
         super().__init__()
         self.device = device
         self.reg_loss = nn.SmoothL1Loss(reduction="none")
-        self.pos_loss_weight = pos_loss_weight
-        self.wta_epsilon = wta_epsilon
+        self.soft_wta_alpha = soft_wta_alpha
 
     def forward(self, predicted_trajs, data):
         """
-        predicted_trajs: [B, N, K, T, 2]  K=num_modes, T=num_future_steps
+        predicted_trajs: [B, N, K, T, 2]  per-step displacement predictions
         data: dict with:
-            gt_trajectories     [B, N, T, 2]
-            gt_masks            [B, N, T]
-            agent_valid         [B, N]
-            gt_abs_trajectories [B, N, T, 2]
-            gt_anchor           [B, N, 2]
+            gt_abs_trajectories [B, N, T, 2]  absolute GT positions
+            gt_anchor           [B, N, 2]     agent position at t=0
+            gt_masks            [B, N, T]     valid future timestep mask
+            agent_valid         [B, N]        all present agents (social attention context)
+            train_mask          [B, N]        focal + scored agents only (loss supervision)
 
-        Training: epsilon-greedy WTA over K modes (pure WTA when epsilon=0).
-        Validation: pure WTA (torch.is_grad_enabled() == False → epsilon ignored).
+        Winner selection: FDE-based (L2 at last valid timestep).
+        All K modes receive gradient; winner weight=1.0, others weight=soft_wta_alpha.
+        Loss is averaged over train_mask agents only (focal + score categories).
         """
         B, N, K, T, _ = predicted_trajs.shape
 
-        gt         = data["gt_trajectories"].to(self.device, dtype=predicted_trajs.dtype)
-        gt_masks   = data["gt_masks"].to(self.device)       # [B, N, T]
-        agent_valid = data["agent_valid"].to(self.device)   # [B, N]
+        gt_abs      = data["gt_abs_trajectories"].to(self.device, dtype=predicted_trajs.dtype)  # [B, N, T, 2]
+        anchor      = data["gt_anchor"].to(self.device, dtype=predicted_trajs.dtype)            # [B, N, 2]
+        gt_masks    = data["gt_masks"].to(self.device)                                          # [B, N, T]
+        train_mask  = data["train_mask"].to(self.device)                                        # [B, N] focal+score only
 
-        valid_mask = gt_masks & agent_valid.unsqueeze(-1)   # [B, N, T]
-        num_valid  = valid_mask.float().sum()
+        valid_mask = gt_masks & train_mask.unsqueeze(-1)  # [B, N, T]
 
-        # ── Per-mode average displacement loss ───────────────────────────────
-        gt_exp    = gt.unsqueeze(2).expand(-1, -1, K, -1, -1)            # [B, N, K, T, 2]
-        valid_exp = valid_mask.unsqueeze(2).expand(-1, -1, K, -1)        # [B, N, K, T]
+        # ── Displacement → absolute coordinates ──────────────────────────────
+        # anchor: [B, N, 2] → [B, N, 1, 1, 2] for broadcasting
+        pred_abs = anchor.unsqueeze(2).unsqueeze(2) + predicted_trajs.cumsum(dim=-2)  # [B, N, K, T, 2]
 
-        per_step = self.reg_loss(predicted_trajs, gt_exp).sum(dim=-1)    # [B, N, K, T]
+        # ── FDE-based winner selection ────────────────────────────────────────
+        # last valid timestep index per agent [B, N]
+        valid_float = valid_mask.float()
+        last_valid_idx = (valid_float.cumsum(dim=-1) * valid_float).argmax(dim=-1)  # [B, N]
+        has_any_valid  = valid_mask.any(dim=-1)
+        last_valid_idx = torch.where(has_any_valid, last_valid_idx,
+                                     torch.full_like(last_valid_idx, T - 1))
+
+        # pred at last valid step: [B, N, K, 2]
+        last_exp  = last_valid_idx.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand(B, N, K, 1, 2)
+        pred_last = pred_abs.gather(3, last_exp).squeeze(3)   # [B, N, K, 2]
+
+        # GT at last valid step: [B, N, 2]
+        gt_last_exp = last_valid_idx.unsqueeze(-1).unsqueeze(-1).expand(B, N, 1, 2)
+        gt_last     = gt_abs.gather(2, gt_last_exp).squeeze(2)  # [B, N, 2]
+
+        fde      = (pred_last - gt_last.unsqueeze(2)).norm(dim=-1)  # [B, N, K]
+        best_idx = fde.argmin(dim=-1)                               # [B, N]
+
+        # ── Soft WTA mode weights ─────────────────────────────────────────────
+        mode_weights = torch.full((B, N, K), self.soft_wta_alpha, device=predicted_trajs.device)
+        mode_weights.scatter_(2, best_idx.unsqueeze(-1), 1.0)  # winner → 1.0
+
+        # ── Regression loss on absolute coordinates ───────────────────────────
+        gt_abs_exp = gt_abs.unsqueeze(2).expand(-1, -1, K, -1, -1)   # [B, N, K, T, 2]
+        valid_exp  = valid_mask.unsqueeze(2).expand(-1, -1, K, -1)   # [B, N, K, T]
+
+        per_step = self.reg_loss(pred_abs, gt_abs_exp).sum(dim=-1)   # [B, N, K, T]
         per_step = per_step * valid_exp.float()
-        mode_cnt = valid_exp.float().sum(dim=-1).clamp(min=1e-9)         # [B, N, K]
-        per_mode = per_step.sum(dim=-1) / mode_cnt                       # [B, N, K]
 
-        # ── Winner selection (epsilon-greedy during training) ─────────────────
-        best_idx = per_mode.argmin(dim=-1)                               # [B, N]
+        mode_cnt     = valid_exp.float().sum(dim=-1).clamp(min=1e-9)  # [B, N, K]
+        per_mode_ade = per_step.sum(dim=-1) / mode_cnt                # [B, N, K]  (SmoothL1 ADE)
 
-        if torch.is_grad_enabled() and self.wta_epsilon > 0 and K > 1:
-            # With prob epsilon, override with a uniformly random mode
-            rand_mask = torch.rand(B, N, device=predicted_trajs.device) < self.wta_epsilon
-            rand_idx  = torch.randint(0, K, (B, N), device=predicted_trajs.device)
-            best_idx  = torch.where(rand_mask, rand_idx, best_idx)
+        # weighted sum over modes, then average over focal+scored agents only
+        agent_loss  = (per_mode_ade * mode_weights).sum(dim=-1)       # [B, N]
+        agent_loss  = agent_loss * train_mask.float()
 
-        # ── Gather winning-mode predictions ───────────────────────────────────
-        idx_exp   = best_idx.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) \
-                             .expand(-1, -1, 1, T, 2)                    # [B, N, 1, T, 2]
-        best_pred = predicted_trajs.gather(2, idx_exp).squeeze(2)       # [B, N, T, 2]
+        num_train_agents = train_mask.float().sum().clamp(min=1e-9)
+        reg_loss = agent_loss.sum() / num_train_agents
 
-        # ── Displacement loss (winning mode) ──────────────────────────────────
-        disp_raw    = self.reg_loss(best_pred, gt).sum(dim=-1)           # [B, N, T]
-        disp_masked = disp_raw * valid_mask.float()
-
-        if num_valid > 0:
-            disp_loss = disp_masked.sum() / num_valid
-        else:
-            disp_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-
-        # ── Position reconstruction loss (winning mode) ───────────────────────
-        use_pos_loss = (
-            self.pos_loss_weight > 0.0
-            and "gt_abs_trajectories" in data
-            and "gt_anchor" in data
-        )
-
-        if use_pos_loss:
-            gt_abs = data["gt_abs_trajectories"].to(self.device, dtype=predicted_trajs.dtype)
-            anchor = data["gt_anchor"].to(self.device, dtype=predicted_trajs.dtype)  # [B, N, 2]
-
-            pred_abs   = anchor.unsqueeze(-2) + best_pred.cumsum(dim=-2)  # [B, N, T, 2]
-            pos_raw    = self.reg_loss(pred_abs, gt_abs).sum(dim=-1)       # [B, N, T]
-            pos_masked = pos_raw * valid_mask.float()
-
-            if num_valid > 0:
-                pos_loss = pos_masked.sum() / num_valid
-            else:
-                pos_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-
-            total_loss = disp_loss + self.pos_loss_weight * pos_loss
-            return {"loss": total_loss, "disp_loss": disp_loss, "pos_loss": pos_loss}
-        else:
-            return {"loss": disp_loss, "disp_loss": disp_loss}
+        return {"loss": reg_loss, "reg_loss": reg_loss}

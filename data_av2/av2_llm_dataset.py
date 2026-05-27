@@ -541,12 +541,14 @@ class AV2PromptDataset(Dataset):
         # GT trajectories — same displacement logic as Exp2
         trajs_pos = row["TRAJS"]["trajs_pos"]
         has_flags = row["TRAJS"]["has_flags"]
+        trajs_cat = row["TRAJS"]["trajs_cat"]
 
         gt_trajectories     = torch.zeros(max_total, 60, 2, dtype=torch.float32)
         gt_abs_trajectories = torch.zeros(max_total, 60, 2, dtype=torch.float32)
         gt_anchor           = torch.zeros(max_total, 2,  dtype=torch.float32)
         gt_masks            = torch.zeros(max_total, 60, dtype=torch.bool)
         agent_valid         = torch.zeros(max_total, dtype=torch.bool)
+        train_mask          = torch.zeros(max_total, dtype=torch.bool)
 
         for a_idx, ag_id in enumerate(written_agent_ids):
             abs_pos = torch.tensor(trajs_pos[ag_id, self.obs_len:, :], dtype=torch.float32)
@@ -568,8 +570,11 @@ class AV2PromptDataset(Dataset):
             gt_abs_trajectories[a_idx] = abs_pos
             gt_anchor[a_idx]           = anchor
             gt_masks[a_idx]            = flags
-            # Valid: agent was written AND its prompt has real tokens (not a dummy slot)
-            agent_valid[a_idx]         = (attention_mask[a_idx].sum() > 1)
+            # agent_valid: present in scene (used by social attention for context)
+            agent_valid[a_idx]  = (attention_mask[a_idx].sum() > 1)
+            # train_mask: only focal + scored agents contribute to loss
+            cat = str(trajs_cat[ag_id])
+            train_mask[a_idx]   = agent_valid[a_idx] and (cat in ('focal', 'score'))
 
         return {
             "input_ids":           input_ids,            # [N, L]  — per-agent sequences
@@ -579,5 +584,6 @@ class AV2PromptDataset(Dataset):
             "gt_abs_trajectories": gt_abs_trajectories,  # [N, 60, 2] absolute GT
             "gt_anchor":           gt_anchor,             # [N, 2]
             "gt_masks":            gt_masks,              # [N, 60]
-            "agent_valid":         agent_valid,           # [N]
+            "agent_valid":         agent_valid,           # [N] — social attention mask
+            "train_mask":          train_mask,            # [N] — loss mask (focal+score only)
         }

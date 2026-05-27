@@ -40,6 +40,20 @@ from utils.logger import Logger
 from utils.utils import AverageMeterForDict, set_seed, save_ckpt, distributed_mean
 
 
+def dynamic_pad_collate(batch):
+    """Trim input_ids / attention_mask to the longest *real* token in this batch.
+    Cuts wasted attention compute from O(1536²) to O(actual_max²) per batch.
+    All other tensor fields are fixed-size and go through default collate unchanged.
+    """
+    # actual max token length across all agents in this batch
+    max_len = max(item["attention_mask"].sum(dim=-1).max().item() for item in batch)
+    max_len = int(max_len)
+    for item in batch:
+        item["input_ids"]      = item["input_ids"][:, :max_len]
+        item["attention_mask"] = item["attention_mask"][:, :max_len]
+    return torch.utils.data.dataloader.default_collate(batch)
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument("--features_dir", required=True, default="", type=str, help="Path to the dataset")
@@ -57,9 +71,8 @@ def parse_arguments():
     parser.add_argument("--unfreeze_layers", type=int, default=1, help="Number of LLM layers to unfreeze")
 
     # Loss
-    parser.add_argument("--pos_loss_weight", type=float, default=1.0,
-                        help="[Exp2] Weight for position reconstruction loss. "
-                             "Set to 0.0 to disable (displacement-only, Exp1 behaviour).")
+    parser.add_argument("--soft_wta_alpha", type=float, default=0.1,
+                        help="Soft WTA weight for non-winner modes (0.0 = hard WTA, not recommended).")
 
     # LR Scheduler
     parser.add_argument("--scheduler", type=str, default="cosine_warmup_restart",
@@ -103,10 +116,6 @@ def parse_arguments():
                              "K=1 is single-modal (original behaviour). "
                              "K>1 uses Winner-Takes-All training loss; "
                              "minADE/minFDE take the best mode per sample.")
-    parser.add_argument("--wta_epsilon", type=float, default=0.2,
-                        help="Epsilon-greedy WTA: probability of selecting a random mode "
-                             "instead of the best mode during training. Prevents mode collapse "
-                             "when K>1. Set to 0.0 for pure WTA. Ignored during validation.")
 
     # Gradient clipping
     parser.add_argument("--grad_clip", type=float, default=1.0,
@@ -127,6 +136,12 @@ def parse_arguments():
     parser.add_argument("--compile", action="store_true",
                         help="Wrap model with torch.compile after DDP for extra speed. "
                              "First iteration will be slow (3-10 min compilation).")
+
+    # DDP backend
+    parser.add_argument("--dist_backend", type=str, default="gloo",
+                        choices=["gloo", "nccl"],
+                        help="DDP backend. Use 'nccl' on Linux/Ada+ GPUs for best performance. "
+                             "Default 'gloo' for Windows/Blackwell (sm_120) compatibility.")
 
     return parser.parse_args()
 
@@ -189,14 +204,14 @@ def main():
     logger = Logger(date_str=date_str, enable=is_main, log_dir=log_dir,
                     enable_flags={'writer': args.logger_writer})
 
-    # RTX 5090 (Blackwell sm_120) is incompatible with PyTorch 2.7 NCCL in multi-process DDP.
-    # NCCL does not raise an exception — it silently hangs, so try/except cannot catch it.
-    # Gloo overhead is negligible: 5.3M trainable params = ~10.6 MB gradient, ~0.4 ms per sync.
-    os.environ.setdefault("GLOO_SOCKET_IFNAME", "eth0")
-    os.environ.setdefault("GLOO_DEVICE_TRANSPORT", "TCP")
-    os.environ.setdefault("GLOO_SOCKET_NTHREADS", "8")
-    dist.init_process_group(backend="gloo", timeout=datetime.timedelta(minutes=10))
-    logger.print(f"Using Gloo backend | world_size={world_size} | rank={global_rank}")
+    # Always use Gloo: NCCL causes illegal memory access on both Blackwell (sm_120)
+    # and RTX 6000 setups. Overhead is negligible — only 5.3M trainable params (~10MB grad).
+    os.environ["GLOO_SOCKET_IFNAME"] = "eth0"
+    os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
+    os.environ["GLOO_SOCKET_NTHREADS"] = "8"
+    os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"  # suppress background NCCL watchdog if any
+    dist.init_process_group(backend="gloo", timeout=datetime.timedelta(minutes=30))
+    logger.print(f"Using GLOO backend | world_size={world_size} | rank={global_rank}")
 
     if is_main:
         logger.log_basics(args=args, datetime=date_str)
@@ -247,10 +262,10 @@ def main():
     persistent = args.num_workers > 0
     dl_train = DataLoader(train_set, batch_size=args.train_batch_size, sampler=train_sampler,
                           num_workers=args.num_workers, pin_memory=True,
-                          persistent_workers=persistent)
+                          persistent_workers=persistent, collate_fn=dynamic_pad_collate)
     dl_val   = DataLoader(val_set,   batch_size=args.val_batch_size,   sampler=val_sampler,
                           num_workers=args.num_workers, pin_memory=True,
-                          persistent_workers=persistent)
+                          persistent_workers=persistent, collate_fn=dynamic_pad_collate)
 
     iters_per_epoch = len(dl_train)
     val_iters = len(dl_val)
@@ -302,15 +317,13 @@ def main():
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     if args.compile:
-        model = torch.compile(model, mode="reduce-overhead")
-        logger.print("torch.compile enabled (mode=reduce-overhead) — first iter ~3-10 min")
+        model = torch.compile(model, mode="default")
+        logger.print("torch.compile enabled (mode=default) — first iter ~3-10 min")
 
-    loss_fn = LLMMotionLoss(device=device, pos_loss_weight=args.pos_loss_weight,
-                            wta_epsilon=args.wta_epsilon)
+    loss_fn = LLMMotionLoss(device=device, soft_wta_alpha=args.soft_wta_alpha)
     if is_main:
-        logger.print(f"Loss: disp_loss + {args.pos_loss_weight} × pos_loss "
-                     f"({'hybrid' if args.pos_loss_weight > 0 else 'displacement-only'}) | "
-                     f"WTA epsilon={args.wta_epsilon} ({'epsilon-greedy' if args.wta_epsilon > 0 else 'pure WTA'})")
+        logger.print(f"Loss: FDE-WTA SmoothL1 on absolute coords | "
+                     f"Soft WTA alpha={args.soft_wta_alpha} (winner=1.0, others={args.soft_wta_alpha})")
 
         n_trainable, n_total = count_trainable_params(model)
         logger.print(f"Model params: trainable={n_trainable:,} / total={n_total:,} "
