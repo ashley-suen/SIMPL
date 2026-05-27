@@ -67,7 +67,7 @@ def parse_arguments():
 
     # LLM Specific Args
     parser.add_argument("--llm_lr", type=float, default=1e-5, help="Learning rate for LLM layers")
-    parser.add_argument("--mlp_lr", type=float, default=1e-4, help="Learning rate for MLP head")
+    parser.add_argument("--gru_lr", type=float, default=1e-4, help="Learning rate for GRU decoder and social attention")
     parser.add_argument("--unfreeze_layers", type=int, default=1, help="Number of LLM layers to unfreeze")
 
     # Loss
@@ -149,7 +149,7 @@ def parse_arguments():
 def format_lr(optimizer):
     """Format current LRs of each param group as a readable string."""
     parts = []
-    names = ["llm", "social", "mlp"]
+    names = ["llm", "social", "gru"]
     for i, pg in enumerate(optimizer.param_groups):
         name = names[i] if i < len(names) else f"g{i}"
         parts.append(f"{name}_lr={pg['lr']:.2e}")
@@ -322,7 +322,7 @@ def main():
 
     loss_fn = LLMMotionLoss(device=device, soft_wta_alpha=args.soft_wta_alpha)
     if is_main:
-        logger.print(f"Loss: FDE-WTA SmoothL1 on absolute coords | "
+        logger.print(f"Loss: FDE-WTA SmoothL1 on displacement space (detached cumsum for winner) | "
                      f"Soft WTA alpha={args.soft_wta_alpha} (winner=1.0, others={args.soft_wta_alpha})")
 
         n_trainable, n_total = count_trainable_params(model)
@@ -332,18 +332,18 @@ def main():
     # 3. Optimizer (Differential Learning Rates)
     # DDP prefixes names with "module." — use substring match instead of startswith
     llm_params    = [p for n, p in model.named_parameters() if p.requires_grad and "llm." in n]
-    mlp_params    = [p for n, p in model.named_parameters() if p.requires_grad and "mlp_head." in n]
+    gru_params    = [p for n, p in model.named_parameters() if p.requires_grad and "gru_decoder." in n]
     social_params = [p for n, p in model.named_parameters() if p.requires_grad and "social_attn." in n]
 
     if is_main:
         logger.print(f"Trainable groups: llm_params={sum(p.numel() for p in llm_params):,}, "
                      f"social_params={sum(p.numel() for p in social_params):,}, "
-                     f"mlp_params={sum(p.numel() for p in mlp_params):,}")
+                     f"gru_params={sum(p.numel() for p in gru_params):,}")
 
     optimizer = AdamW([
         {'params': llm_params,    'lr': args.llm_lr},
-        {'params': social_params, 'lr': args.mlp_lr},
-        {'params': mlp_params,    'lr': args.mlp_lr},
+        {'params': social_params, 'lr': args.gru_lr},
+        {'params': gru_params,    'lr': args.gru_lr},
     ], weight_decay=1e-4)
 
     # --- LR Scheduler ---
@@ -367,7 +367,7 @@ def main():
             logger.print(f"Scheduler: CosineWarmupRestart | T_0={_T0}, "
                          f"warmup={_wu} epochs, eta_min_ratio={_r} "
                          f"(floor={args.llm_lr * _r:.2e} for llm, "
-                         f"{args.mlp_lr * _r:.2e} for mlp)")
+                         f"{args.gru_lr * _r:.2e} for gru/social)")
     elif args.scheduler == "cosine_restart":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=args.T_0, T_mult=args.T_mult
