@@ -1,0 +1,156 @@
+================================================================================
+SPLIT: train  (data_av2/features/train)
+================================================================================
+Dataset size: 20   |   Selected index: 19
+
+Agents written: 3  (traj indices: [0, 13, 14])
+Agent token positions (index of [PREDICT]: per agent): [1258, 1332, 1407]
+
+--------------------------------------------------------------------------------
+UNIFIED PROMPT (full scene, all agents):
+--------------------------------------------------------------------------------
+Scenario 'ec34fcbf-4dbe-4779-8205-ab70fc752132' in miami. Task: High-Fidelity Motion Prediction.
+[SCENARIO IDENTIFICATION]
+Labels: Straight Roadway
+
+[AFFORDANCE & INTENTION]
+Focal Agent Intention: Keep-Straight
+Map Affordance: Lane-Change-Restricted-Left (Solid Line)
+
+[AGENT HISTORY]
+[FOCAL DYNAMICS]
+Speed: 7.5→7.5m/s (constant speed) | Heading: straight ahead
+
+* Focal Agent [Host]: t=0:(-35.5,0.6)|V:7.5m/s -> t=1:(-34.9,0.6)|V:7.5m/s -> t=2:(-34.1,0.6)|V:7.5m/s -> t=3:(-33.2,0.6)|V:7.5m/s -> t=4:(-32.3,0.6)|V:7.5m/s -> t=5:(-31.3,0.6)|V:7.5m/s -> t=6:(-30.2,0.6)|V:7.6m/s -> t=7:(-29.1,0.6)|V:7.5m/s -> t=8:(-28.0,0.5)|V:7.4m/s -> t=9:(-27.0,0.5)|V:7.5m/s -> t=10:(-26.1,0.5)|V:7.5m/s -> t=11:(-25.2,0.4)|V:7.5m/s -> t=12:(-24.6,0.4)|V:7.5m/s -> t=13:(-24.1,0.5)|V:7.4m/s -> t=14:(-23.6,0.5)|V:7.4m/s -> t=15:(-22.9,0.5)|V:7.4m/s -> t=16:(-22.1,0.5)|V:7.4m/s -> t=17:(-21.3,0.4)|V:7.4m/s -> t=18:(-20.6,0.4)|V:7.4m/s -> t=19:(-19.8,0.4)|V:7.3m/s -> t=20:(-19.1,0.3)|V:7.3m/s -> t=21:(-18.4,0.3)|V:7.2m/s -> t=22:(-17.7,0.2)|V:7.2m/s -> t=23:(-17.0,0.2)|V:7.2m/s -> t=24:(-16.2,0.1)|V:7.2m/s -> t=25:(-15.5,0.1)|V:7.1m/s -> t=26:(-14.8,0.1)|V:7.1m/s -> t=27:(-14.1,0.1)|V:7.1m/s -> t=28:(-13.4,0.0)|V:7.1m/s -> t=29:(-12.7,-0.0)|V:7.0m/s -> t=30:(-12.0,-0.0)|V:7.0m/s -> t=31:(-11.4,-0.1)|V:7.0m/s -> t=32:(-10.7,-0.1)|V:6.9m/s -> t=33:(-10.0,-0.1)|V:6.9m/s -> t=34:(-9.4,-0.1)|V:6.9m/s -> t=35:(-8.7,-0.1)|V:6.8m/s -> t=36:(-8.0,-0.1)|V:6.8m/s -> t=37:(-7.4,-0.2)|V:6.8m/s -> t=38:(-6.8,-0.2)|V:6.7m/s -> t=39:(-6.1,-0.2)|V:6.7m/s -> t=40:(-5.5,-0.1)|V:6.6m/s -> t=41:(-4.8,-0.1)|V:6.6m/s -> t=42:(-4.2,-0.1)|V:6.5m/s -> t=43:(-3.6,-0.1)|V:6.4m/s -> t=44:(-2.9,-0.1)|V:6.4m/s -> t=45:(-2.3,-0.0)|V:6.3m/s -> t=46:(-1.7,-0.0)|V:6.1m/s -> t=47:(-1.2,-0.0)|V:6.1m/s -> t=48:(-0.6,-0.0)|V:6.0m/s -> t=49:(0.0,0.0)|V:5.9m/s
+[PREDICT]:
+[RELATIVE CONTEXT vs FOCAL AGENT]
+Distance: 4.6m | Position: right-front | Relative speed: -7.5m/s (slower than focal) | Risk: low influence (parked)
+
+- Vehicle: t=0~49 Stationary at (3.6, -2.9)
+[PREDICT]:
+[RELATIVE CONTEXT vs FOCAL AGENT]
+Distance: 6.9m | Position: far-left-front | Relative speed: -7.5m/s (slower than focal) | Risk: low influence (parked)
+
+- Vehicle: t=0~49 Stationary at (3.8, 5.7)
+[PREDICT]:
+
+--------------------------------------------------------------------------------
+Valid tokens: 1408 / 4096  (34.4% utilization)
+
+================================================================================
+__getitem__ tensor shapes
+================================================================================
+  input_ids                : (4096,)               dtype=torch.int64
+  attention_mask           : (4096,)               dtype=torch.int64
+  agent_positions          : (6,)                  dtype=torch.int64
+  gt_trajectories          : (6, 60, 2)            dtype=torch.float32
+  gt_abs_trajectories      : (6, 60, 2)            dtype=torch.float32
+  gt_anchor                : (6, 2)                dtype=torch.float32
+  gt_masks                 : (6, 60)               dtype=torch.bool
+  agent_valid              : (6,)                  dtype=torch.bool
+  train_mask               : (6,)                  dtype=torch.bool
+
+================================================================================
+Agent positions — token extracted for each agent
+(The hidden state at this token index feeds into GRU Decoder)
+================================================================================
+  slot   traj_id   token_pos   valid   train  decoded token
+  ----   -------   ---------  ------  ------  -------------
+     0         0        1258    True    True  ']:
+'
+     1        13        1332    True   False  ']:
+'
+     2        14        1407    True   False  ']:
+'
+     3         -           0   False   False  '(padding slot)'
+     4         -           0   False   False  '(padding slot)'
+     5         -           0   False   False  '(padding slot)'
+
+================================================================================
+SPLIT: val  (data_av2/features/val)
+================================================================================
+Dataset size: 20   |   Selected index: 16
+
+Agents written: 6  (traj indices: [0, 8, 1, 4, 7, 5])
+Agent token positions (index of [PREDICT]: per agent): [1264, 2423, 2498, 3692, 3770, 3849]
+
+--------------------------------------------------------------------------------
+UNIFIED PROMPT (full scene, all agents):
+--------------------------------------------------------------------------------
+Scenario 'be224eae-eda7-4930-8286-a1c448d5945b' in palo-alto. Task: High-Fidelity Motion Prediction.
+[SCENARIO IDENTIFICATION]
+Labels: Approaching Intersection
+
+[AFFORDANCE & INTENTION]
+Focal Agent Intention: Keep-Straight
+Map Affordance: Intersection-Rules-Apply, Lane-Change-Restricted-Left (Solid Line), Lane-Change-Allowed-Right
+
+[AGENT HISTORY]
+[FOCAL DYNAMICS]
+Speed: 9.8→9.8m/s (constant speed) | Heading: straight ahead
+
+* Focal Agent [Host]: t=0:(-24.8,0.5)|V:10.0m/s -> t=1:(-24.3,0.5)|V:9.8m/s -> t=2:(-23.7,0.5)|V:9.6m/s -> t=3:(-23.0,0.4)|V:9.4m/s -> t=4:(-22.2,0.4)|V:9.1m/s -> t=5:(-21.3,0.4)|V:9.0m/s -> t=6:(-20.4,0.4)|V:8.8m/s -> t=7:(-19.5,0.4)|V:8.5m/s -> t=8:(-18.6,0.4)|V:8.3m/s -> t=9:(-17.7,0.4)|V:8.1m/s -> t=10:(-16.9,0.4)|V:7.9m/s -> t=11:(-16.2,0.4)|V:7.8m/s -> t=12:(-15.4,0.4)|V:7.7m/s -> t=13:(-14.7,0.4)|V:7.6m/s -> t=14:(-14.0,0.3)|V:7.4m/s -> t=15:(-13.3,0.3)|V:7.3m/s -> t=16:(-12.6,0.3)|V:7.1m/s -> t=17:(-12.0,0.3)|V:6.9m/s -> t=18:(-11.3,0.3)|V:6.6m/s -> t=19:(-10.7,0.3)|V:6.3m/s -> t=20:(-10.1,0.2)|V:6.0m/s -> t=21:(-9.6,0.2)|V:5.8m/s -> t=22:(-9.0,0.2)|V:5.6m/s -> t=23:(-8.5,0.2)|V:5.4m/s -> t=24:(-8.0,0.2)|V:5.3m/s -> t=25:(-7.5,0.2)|V:5.2m/s -> t=26:(-7.0,0.2)|V:5.0m/s -> t=27:(-6.6,0.2)|V:4.8m/s -> t=28:(-6.1,0.2)|V:4.4m/s -> t=29:(-5.7,0.2)|V:4.2m/s -> t=30:(-5.3,0.1)|V:3.9m/s -> t=31:(-4.9,0.1)|V:3.7m/s -> t=32:(-4.6,0.1)|V:3.5m/s -> t=33:(-4.2,0.1)|V:3.3m/s -> t=34:(-3.9,0.1)|V:3.2m/s -> t=35:(-3.5,0.1)|V:3.1m/s -> t=36:(-3.2,0.1)|V:3.0m/s -> t=37:(-2.8,0.1)|V:2.8m/s -> t=38:(-2.5,0.1)|V:2.7m/s -> t=39:(-2.2,0.1)|V:2.6m/s -> t=40:(-2.0,0.1)|V:2.6m/s -> t=41:(-1.7,0.1)|V:2.6m/s -> t=42:(-1.4,0.1)|V:2.6m/s -> t=43:(-1.2,0.0)|V:2.6m/s -> t=44:(-1.0,0.0)|V:2.5m/s -> t=45:(-0.7,0.0)|V:2.3m/s -> t=46:(-0.5,0.0)|V:2.2m/s -> t=47:(-0.3,0.0)|V:2.0m/s -> t=48:(-0.2,0.0)|V:2.0m/s -> t=49:(0.0,0.0)|V:1.9m/s
+[PREDICT]:
+[RELATIVE CONTEXT vs FOCAL AGENT]
+Distance: 9.1m | Position: left-front | Relative speed: -2.4m/s (slower than focal) | Risk: moderate influence (close proximity)
+
+- Vehicle: t=0:(23.2,-15.5)|V:4.8m/s -> t=1:(23.2,-15.3)|V:4.6m/s -> t=2:(23.2,-15.1)|V:4.5m/s -> t=3:(23.2,-14.8)|V:4.3m/s -> t=4:(23.2,-14.5)|V:4.2m/s -> t=5:(23.1,-14.2)|V:4.0m/s -> t=6:(23.1,-13.8)|V:3.9m/s -> t=7:(23.1,-13.4)|V:3.8m/s -> t=8:(23.0,-13.0)|V:3.7m/s -> t=9:(23.0,-12.6)|V:3.7m/s -> t=10:(22.9,-12.2)|V:3.7m/s -> t=11:(22.8,-11.8)|V:3.8m/s -> t=12:(22.7,-11.4)|V:3.9m/s -> t=13:(22.6,-11.0)|V:4.0m/s -> t=14:(22.5,-10.6)|V:4.1m/s -> t=15:(22.4,-10.2)|V:4.1m/s -> t=16:(22.3,-9.8)|V:4.2m/s -> t=17:(22.2,-9.4)|V:4.2m/s -> t=18:(22.0,-9.0)|V:4.2m/s -> t=19:(21.9,-8.6)|V:4.2m/s -> t=20:(21.7,-8.2)|V:4.2m/s -> t=21:(21.5,-7.8)|V:4.3m/s -> t=22:(21.3,-7.4)|V:4.3m/s -> t=23:(21.1,-7.0)|V:4.3m/s -> t=24:(20.8,-6.5)|V:4.4m/s -> t=25:(20.6,-6.1)|V:4.6m/s -> t=26:(20.3,-5.7)|V:4.8m/s -> t=27:(20.0,-5.2)|V:5.0m/s -> t=28:(19.7,-4.8)|V:5.2m/s -> t=29:(19.4,-4.4)|V:5.3m/s -> t=30:(19.0,-3.9)|V:5.5m/s -> t=31:(18.6,-3.5)|V:5.6m/s -> t=32:(18.2,-3.1)|V:5.7m/s -> t=33:(17.8,-2.7)|V:5.8m/s -> t=34:(17.4,-2.3)|V:5.8m/s -> t=35:(16.9,-1.9)|V:5.8m/s -> t=36:(16.4,-1.5)|V:5.8m/s -> t=37:(15.9,-1.1)|V:5.9m/s -> t=38:(15.4,-0.7)|V:6.0m/s -> t=39:(14.9,-0.4)|V:6.1m/s -> t=40:(14.3,-0.0)|V:6.1m/s -> t=41:(13.8,0.3)|V:6.4m/s -> t=42:(13.2,0.7)|V:6.5m/s -> t=43:(12.6,1.0)|V:6.6m/s -> t=44:(12.0,1.3)|V:6.7m/s -> t=45:(11.4,1.6)|V:6.8m/s -> t=46:(10.7,1.9)|V:7.0m/s -> t=47:(10.1,2.2)|V:7.2m/s -> t=48:(9.4,2.5)|V:7.3m/s -> t=49:(8.7,2.7)|V:7.4m/s
+[PREDICT]:
+[RELATIVE CONTEXT vs FOCAL AGENT]
+Distance: 6.2m | Position: right-front | Relative speed: -8.3m/s (slower than focal) | Risk: low influence (parked)
+
+- Autonomous Vehicle: t=0~49 Stationary at (4.9, -3.8)
+[PREDICT]:
+[RELATIVE CONTEXT vs FOCAL AGENT]
+Distance: 21.7m | Position: far-left-front | Relative speed: -8.0m/s (slower than focal) | Risk: low influence
+
+- Vehicle: t=0:(10.4,28.8)|V:2.7m/s -> t=1:(10.4,28.7)|V:2.7m/s -> t=2:(10.4,28.6)|V:2.7m/s -> t=3:(10.4,28.4)|V:2.7m/s -> t=4:(10.4,28.3)|V:2.7m/s -> t=5:(10.4,28.1)|V:2.6m/s -> t=6:(10.4,27.9)|V:2.5m/s -> t=7:(10.4,27.7)|V:2.5m/s -> t=8:(10.4,27.4)|V:2.4m/s -> t=9:(10.3,27.2)|V:2.3m/s -> t=10:(10.4,27.0)|V:2.3m/s -> t=11:(10.4,26.7)|V:2.2m/s -> t=12:(10.4,26.5)|V:2.2m/s -> t=13:(10.4,26.3)|V:2.2m/s -> t=14:(10.4,26.1)|V:2.1m/s -> t=15:(10.4,25.9)|V:2.1m/s -> t=16:(10.4,25.7)|V:2.1m/s -> t=17:(10.4,25.5)|V:2.1m/s -> t=18:(10.4,25.2)|V:2.1m/s -> t=19:(10.4,25.0)|V:2.1m/s -> t=20:(10.4,24.8)|V:2.1m/s -> t=21:(10.4,24.6)|V:2.1m/s -> t=22:(10.4,24.4)|V:2.0m/s -> t=23:(10.3,24.2)|V:2.0m/s -> t=24:(10.3,24.0)|V:2.0m/s -> t=25:(10.3,23.8)|V:2.0m/s -> t=26:(10.3,23.6)|V:2.0m/s -> t=27:(10.3,23.4)|V:2.0m/s -> t=28:(10.3,23.2)|V:2.0m/s -> t=29:(10.3,23.0)|V:2.0m/s -> t=30:(10.3,22.8)|V:2.0m/s -> t=31:(10.3,22.6)|V:1.9m/s -> t=32:(10.3,22.4)|V:1.9m/s -> t=33:(10.3,22.2)|V:1.9m/s -> t=34:(10.3,22.0)|V:1.9m/s -> t=35:(10.3,21.8)|V:1.9m/s -> t=36:(10.3,21.6)|V:1.8m/s -> t=37:(10.3,21.4)|V:1.8m/s -> t=38:(10.3,21.3)|V:1.9m/s -> t=39:(10.3,21.1)|V:1.9m/s -> t=40:(10.3,20.9)|V:1.9m/s -> t=41:(10.3,20.7)|V:1.9m/s -> t=42:(10.3,20.5)|V:1.9m/s -> t=43:(10.3,20.3)|V:1.9m/s -> t=44:(10.3,20.1)|V:1.9m/s -> t=45:(10.3,20.0)|V:1.9m/s -> t=46:(10.3,19.8)|V:1.8m/s -> t=47:(10.3,19.6)|V:1.8m/s -> t=48:(10.3,19.4)|V:1.8m/s -> t=49:(10.3,19.1)|V:1.9m/s
+[PREDICT]:
+[RELATIVE CONTEXT vs FOCAL AGENT]
+Distance: 17.9m | Position: far-left-rear | Relative speed: -9.8m/s (slower than focal) | Risk: low influence (parked)
+
+- Vehicle: t=0~49 Stationary at (-9.1, 15.4)
+[PREDICT]:
+[RELATIVE CONTEXT vs FOCAL AGENT]
+Distance: 19.8m | Position: far-left-rear | Relative speed: -9.8m/s (slower than focal) | Risk: low influence (parked)
+
+- Vehicle: t=0~49 Stationary at (-12.2, 15.6)
+[PREDICT]:
+
+--------------------------------------------------------------------------------
+Valid tokens: 3850 / 4096  (94.0% utilization)
+
+================================================================================
+__getitem__ tensor shapes
+================================================================================
+  input_ids                : (4096,)               dtype=torch.int64
+  attention_mask           : (4096,)               dtype=torch.int64
+  agent_positions          : (6,)                  dtype=torch.int64
+  gt_trajectories          : (6, 60, 2)            dtype=torch.float32
+  gt_abs_trajectories      : (6, 60, 2)            dtype=torch.float32
+  gt_anchor                : (6, 2)                dtype=torch.float32
+  gt_masks                 : (6, 60)               dtype=torch.bool
+  agent_valid              : (6,)                  dtype=torch.bool
+  train_mask               : (6,)                  dtype=torch.bool
+
+================================================================================
+Agent positions — token extracted for each agent
+(The hidden state at this token index feeds into GRU Decoder)
+================================================================================
+  slot   traj_id   token_pos   valid   train  decoded token
+  ----   -------   ---------  ------  ------  -------------
+     0         0        1264    True    True  ']:
+'
+     1         8        2423    True   False  ']:
+'
+     2         1        2498    True   False  ']:
+'
+     3         4        3692    True   False  ']:
+'
+     4         7        3770    True   False  ']:
+'
+     5         5        3849    True   False  ']:
+'
+
+================================================================================
+Done.

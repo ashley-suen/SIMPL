@@ -12,7 +12,7 @@ class AV2PromptDataset(Dataset):
     and converts the numerical trajectory and lane graph data into 
     a highly semantic, instance-centric Language Model Prompt.
     """
-    def __init__(self, data_dir, tokenizer_name="HuggingFaceTB/SmolLM-135M", obs_len=50, max_neighbors=5, max_lanes=10, traj_step=1, max_len_per_agent=2000):
+    def __init__(self, data_dir, tokenizer_name="Qwen/Qwen3-0.6B-Base", obs_len=50, max_neighbors=5, max_lanes=10, traj_step=1, max_len_per_agent=8192):
         super().__init__()
         self.data_dir = data_dir
         # Search recursively to support both flat and subdirectory layouts
@@ -454,9 +454,28 @@ class AV2PromptDataset(Dataset):
             trajs_vel[0, :self.obs_len][has_flags[0, :self.obs_len]], axis=1)
         focal_is_stationary = focal_valid_vels.max() < 0.5 if len(focal_valid_vels) > 0 else True
 
+        # Focal dynamics summary (semantic, language-friendly)
+        speed_delta = fk["last_speed"] - fk["first_speed"]
+        if speed_delta > 0.5:
+            speed_trend = "accelerating"
+        elif speed_delta < -0.5:
+            speed_trend = "decelerating"
+        else:
+            speed_trend = "constant speed"
+        if abs(fk["heading_change"]) > 0.3:
+            heading_desc = "turning left" if fk["heading_change"] > 0 else "turning right"
+        elif abs(fk["heading_change"]) > 0.1:
+            heading_desc = "slight curve"
+        else:
+            heading_desc = "straight ahead"
+        focal_dynamics = (f"[FOCAL DYNAMICS]\n"
+                          f"Speed: {fk['first_speed']:.1f}→{fk['last_speed']:.1f}m/s "
+                          f"({speed_trend}) | Heading: {heading_desc}\n\n")
+
         if focal_is_stationary:
             pos = trajs_pos[0, 49] if has_flags[0, 49] else trajs_pos[0, 0]
-            focal_seg = (f"* Focal Agent [Host]: t=0~49 Stationary at "
+            focal_seg = (focal_dynamics +
+                         f"* Focal Agent [Host]: t=0~49 Stationary at "
                          f"({pos[0]:.1f}, {pos[1]:.1f})\n[PREDICT]:")
         else:
             f_steps = []
@@ -465,7 +484,8 @@ class AV2PromptDataset(Dataset):
                     pos = trajs_pos[0, t]
                     spd = np.linalg.norm(trajs_vel[0, t])
                     f_steps.append(f"t={t}:({pos[0]:.1f},{pos[1]:.1f})|V:{spd:.1f}m/s")
-            focal_seg = f"* Focal Agent [Host]: {' -> '.join(f_steps)}\n[PREDICT]:"
+            focal_seg = (focal_dynamics +
+                         f"* Focal Agent [Host]: {' -> '.join(f_steps)}\n[PREDICT]:")
 
         agent_prompts     = [(scene_header + focal_seg, 0)]
         written_agent_ids = [0]
@@ -483,10 +503,27 @@ class AV2PromptDataset(Dataset):
             start_note = f" (Entered scene at t={first_idx})" if first_idx > 0 else ""
             agent_type = self._cat_name(n["cat"])
 
+            # Relative context block (semantic, language-friendly)
+            sr_parts     = n["semantic_role"].split(" | ")
+            position_str = sr_parts[0].replace("pos(t=49): ", "") if sr_parts else "unknown"
+            interact_str = sr_parts[2].replace("interaction: ", "") if len(sr_parts) > 2 else "unknown"
+            dist_m       = np.hypot(n["curr_pos"][0], n["curr_pos"][1])
+            rel_v        = n["curr_speed"] - fk["last_speed"]
+            if rel_v > 0.5:
+                rel_v_desc = f"+{rel_v:.1f}m/s (faster than focal, approaching if ahead)"
+            elif rel_v < -0.5:
+                rel_v_desc = f"{rel_v:.1f}m/s (slower than focal)"
+            else:
+                rel_v_desc = f"similar speed to focal ({n['curr_speed']:.1f}m/s)"
+            rel_block = (f"[RELATIVE CONTEXT vs FOCAL AGENT]\n"
+                         f"Distance: {dist_m:.1f}m | Position: {position_str} | "
+                         f"Relative speed: {rel_v_desc} | Risk: {interact_str}\n\n")
+
             if n["is_stationary"]:
                 t_range = f"t={first_idx}~49" if first_idx > 0 else "t=0~49"
-                nbr_seg = (f"- {agent_type} (Impact:{n['influence_score']:.0f}){start_note} "
-                           f"[{n['semantic_role']}]: {t_range} Stationary at "
+                nbr_seg = (rel_block +
+                           f"- {agent_type}{start_note}: "
+                           f"{t_range} Stationary at "
                            f"({n['curr_pos'][0]:.1f}, {n['curr_pos'][1]:.1f})\n[PREDICT]:")
             else:
                 n_steps = []
@@ -495,8 +532,8 @@ class AV2PromptDataset(Dataset):
                         pos = n["pos_hist"][t]
                         spd = np.linalg.norm(n["vel_hist"][t])
                         n_steps.append(f"t={t}:({pos[0]:.1f},{pos[1]:.1f})|V:{spd:.1f}m/s")
-                nbr_seg = (f"- {agent_type} (Impact:{n['influence_score']:.0f}){start_note} "
-                           f"[{n['semantic_role']}]: {' -> '.join(n_steps)}\n[PREDICT]:")
+                nbr_seg = (rel_block +
+                           f"- {agent_type}{start_note}: {' -> '.join(n_steps)}\n[PREDICT]:")
 
             agent_prompts.append((scene_header + nbr_seg, n["id"]))
             written_agent_ids.append(n["id"])
@@ -504,41 +541,220 @@ class AV2PromptDataset(Dataset):
 
         return agent_prompts, written_agent_ids
 
+    def generate_unified_prompt(self, df_row):
+        """
+        Build one unified prompt for the entire scene containing all agents.
+        Each agent's section ends with [PREDICT]: — we extract the token index
+        of that marker to use as the agent's representation in the LLM hidden states.
+
+        Returns:
+            input_ids:            LongTensor [L]
+            attention_mask:       LongTensor [L]
+            agent_token_positions: list[int]  — token index of [PREDICT]: per agent
+            written_agent_ids:    list[int]   — indices into trajs_pos
+        """
+        seq_id     = df_row["SEQ_ID"]
+        city_name  = df_row["CITY_NAME"]
+        trajs      = df_row["TRAJS"]
+        lane_graph = df_row["LANE_GRAPH"]
+
+        trajs_pos  = trajs["trajs_pos"]
+        trajs_vel  = trajs["trajs_vel"]
+        has_flags  = trajs["has_flags"]
+        trajs_cat  = trajs["trajs_cat"]
+
+        fk = self._extract_focal_kinematics(trajs_pos, trajs_vel, has_flags, lane_graph)
+
+        # Collect valid neighbors
+        neighbors_info = []
+        trajs_ctrs = trajs["trajs_ctrs"]
+        trajs_vecs = trajs["trajs_vecs"]
+        for i in range(1, len(trajs_cat)):
+            if has_flags[i, self.obs_len - 1]:
+                ctr, vec  = trajs_ctrs[i], trajs_vecs[i]
+                theta     = np.arctan2(vec[1], vec[0])
+                rot_mat   = np.array([[np.cos(theta), -np.sin(theta)],
+                                      [np.sin(theta),  np.cos(theta)]])
+                pos_focal  = trajs_pos[i, :self.obs_len, :].dot(rot_mat.T) + ctr
+                vel_focal  = trajs_vel[i, :self.obs_len, :].dot(rot_mat.T)
+                curr_pos   = pos_focal[-1]
+                curr_vel   = vel_focal[-1]
+                curr_speed = np.linalg.norm(curr_vel)
+                raw_n      = {"curr_pos": curr_pos, "curr_vel": curr_vel,
+                              "curr_speed": curr_speed, "vel_hist": vel_focal,
+                              "pos_hist": pos_focal, "flags": has_flags[i, :self.obs_len]}
+                semantic_role, influence_score, is_stationary = \
+                    self._extract_spatial_relations(raw_n, fk["last_speed"])
+                if influence_score <= 0 and "low influence" in semantic_role:
+                    continue
+                neighbors_info.append({
+                    "id": i, "cat": trajs_cat[i],
+                    "pos_hist": pos_focal, "vel_hist": vel_focal,
+                    "flags": has_flags[i, :self.obs_len],
+                    "semantic_role": semantic_role,
+                    "influence_score": influence_score,
+                    "is_stationary": is_stationary,
+                    "curr_pos": curr_pos,
+                    "curr_speed": curr_speed,
+                })
+        neighbors_info.sort(key=lambda x: x["influence_score"], reverse=True)
+
+        labels, intention, affordances = \
+            self._identify_scenarios_and_intention(fk, lane_graph, neighbors_info)
+
+        # ── Scene header ──────────────────────────────────────────────────────
+        prompt  = f"Scenario '{seq_id}' in {city_name}. Task: High-Fidelity Motion Prediction.\n"
+        prompt += f"[SCENARIO IDENTIFICATION]\nLabels: {', '.join(labels)}\n\n"
+        prompt += (f"[AFFORDANCE & INTENTION]\nFocal Agent Intention: {intention}\n"
+                   f"Map Affordance: {', '.join(affordances)}\n\n")
+
+        # ── Focal dynamics ────────────────────────────────────────────────────
+        speed_delta = fk["last_speed"] - fk["first_speed"]
+        speed_trend = ("accelerating" if speed_delta > 0.5 else
+                       "decelerating" if speed_delta < -0.5 else "constant speed")
+        heading_desc = ("turning left"  if fk["heading_change"] > 0.3 else
+                        "turning right" if fk["heading_change"] < -0.3 else
+                        "slight curve"  if abs(fk["heading_change"]) > 0.1 else
+                        "straight ahead")
+        prompt += (f"[FOCAL DYNAMICS]\n"
+                   f"Speed: {fk['first_speed']:.1f}→{fk['last_speed']:.1f}m/s "
+                   f"({speed_trend}) | Heading: {heading_desc}\n\n")
+
+        # ── Collect neighbors to write (apply filters first) ─────────────────
+        PREDICT_MARKER = "[PREDICT]:"
+        predict_char_ends = []
+        written_agent_ids = []
+
+        selected_neighbors = []
+        n_count = 0
+        for n in neighbors_info:
+            if n_count >= self.max_neighbors:
+                break
+            if n["influence_score"] < 5 and "low influence" in n["semantic_role"] and n_count >= 2:
+                continue
+            selected_neighbors.append(n)
+            n_count += 1
+
+        # ── BLOCK 1: All relative context summaries (before any trajectory) ──
+        # Placing all context here ensures the focal [PREDICT]: token can attend
+        # to every neighbor's relative information (causal LM ordering).
+        if selected_neighbors:
+            prompt += "[SURROUNDING AGENTS CONTEXT]\n"
+            for k, n in enumerate(selected_neighbors, 1):
+                sr_parts     = n["semantic_role"].split(" | ")
+                position_str = sr_parts[0].replace("pos(t=49): ", "") if sr_parts else "unknown"
+                interact_str = sr_parts[2].replace("interaction: ", "") if len(sr_parts) > 2 else "unknown"
+                dist_m       = np.hypot(n["curr_pos"][0], n["curr_pos"][1])
+                rel_v        = n["curr_speed"] - fk["last_speed"]
+                if rel_v > 0.5:
+                    rel_v_desc = f"+{rel_v:.1f}m/s (faster than focal, approaching if ahead)"
+                elif rel_v < -0.5:
+                    rel_v_desc = f"{rel_v:.1f}m/s (slower than focal)"
+                else:
+                    rel_v_desc = f"similar speed ({n['curr_speed']:.1f}m/s)"
+                agent_type = self._cat_name(n["cat"])
+                prompt += (f"  Agent{k} ({agent_type}): "
+                           f"Distance {dist_m:.1f}m | {position_str} | "
+                           f"Speed {rel_v_desc} | {interact_str}\n")
+            prompt += "\n"
+
+        # ── BLOCK 2: All agent trajectories + [PREDICT]: markers ─────────────
+        # Each [PREDICT]: immediately follows its own trajectory.
+        # Because all relative context is above, focal [PREDICT]: sees everything.
+        prompt += "[AGENT TRAJECTORIES]\n"
+
+        # Focal agent trajectory
+        focal_valid_vels    = np.linalg.norm(
+            trajs_vel[0, :self.obs_len][has_flags[0, :self.obs_len]], axis=1)
+        focal_is_stationary = focal_valid_vels.max() < 0.5 if len(focal_valid_vels) > 0 else True
+
+        if focal_is_stationary:
+            pos = trajs_pos[0, 49] if has_flags[0, 49] else trajs_pos[0, 0]
+            prompt += f"* Focal Agent [Host]: t=0~49 Stationary at ({pos[0]:.1f}, {pos[1]:.1f})\n"
+        else:
+            f_steps = []
+            for t in range(0, self.obs_len, self.traj_step):
+                if has_flags[0, t]:
+                    pos = trajs_pos[0, t]
+                    spd = np.linalg.norm(trajs_vel[0, t])
+                    f_steps.append(f"t={t}:({pos[0]:.1f},{pos[1]:.1f})|V:{spd:.1f}m/s")
+            prompt += f"* Focal Agent [Host]: {' -> '.join(f_steps)}\n"
+        prompt += PREDICT_MARKER + "\n"
+        predict_char_ends.append(len(prompt) - len("\n") - 1)
+        written_agent_ids.append(0)
+
+        # Neighbor trajectories — use same AgentK label as in context summary
+        for k, n in enumerate(selected_neighbors, 1):
+            first_idx  = np.where(n["flags"])[0][0]
+            start_note = f" (Entered at t={first_idx})" if first_idx > 0 else ""
+            agent_type = self._cat_name(n["cat"])
+            label      = f"Agent{k} ({agent_type})"
+
+            if n["is_stationary"]:
+                t_range = f"t={first_idx}~49" if first_idx > 0 else "t=0~49"
+                prompt += (f"- {label}{start_note}: "
+                           f"{t_range} Stationary at ({n['curr_pos'][0]:.1f}, {n['curr_pos'][1]:.1f})\n")
+            else:
+                n_steps = []
+                for t in range(0, self.obs_len, self.traj_step):
+                    if n["flags"][t]:
+                        pos = n["pos_hist"][t]
+                        spd = np.linalg.norm(n["vel_hist"][t])
+                        n_steps.append(f"t={t}:({pos[0]:.1f},{pos[1]:.1f})|V:{spd:.1f}m/s")
+                prompt += f"- {label}{start_note}: {' -> '.join(n_steps)}\n"
+            prompt += PREDICT_MARKER + "\n"
+            predict_char_ends.append(len(prompt) - len("\n") - 1)
+            written_agent_ids.append(n["id"])
+
+        # ── Tokenize with offset mapping ──────────────────────────────────────
+        enc = self.tokenizer(
+            prompt,
+            truncation=True,
+            max_length=self.max_len_per_agent,
+            padding="max_length",
+            return_tensors="pt",
+            return_offsets_mapping=True,
+        )
+        input_ids      = enc["input_ids"].squeeze(0)        # [L]
+        attention_mask = enc["attention_mask"].squeeze(0)   # [L]
+        offsets        = enc["offset_mapping"].squeeze(0)   # [L, 2]
+        L_tok          = input_ids.shape[0]
+
+        # Map character positions to token indices
+        # For each [PREDICT]: end position, find the last token whose start <= char_pos
+        offsets_list = offsets.tolist()
+        agent_token_positions = []
+        for char_end in predict_char_ends:
+            token_idx = 0
+            for i in range(L_tok - 1, -1, -1):
+                s, e = offsets_list[i]
+                if s == 0 and e == 0:
+                    continue    # padding token — skip
+                if s <= char_end:
+                    token_idx = i
+                    break
+            agent_token_positions.append(token_idx)
+
+        return input_ids, attention_mask, agent_token_positions, written_agent_ids
+
     def __getitem__(self, idx):
         file_path = self.file_list[idx]
         df = pd.read_pickle(file_path)
         row = df.iloc[0]
 
-        # --- Plan A: per-agent separate prompts ---
-        agent_prompts, written_agent_ids = self.generate_per_agent_prompts(row)
+        # Unified prompt: one sequence per scene, all agents included
+        input_ids, attention_mask, agent_token_positions, written_agent_ids = \
+            self.generate_unified_prompt(row)
 
-        max_total = self.max_neighbors + 1   # focal + up to max_neighbors
-        L = self.max_len_per_agent
+        max_total  = self.max_neighbors + 1   # focal + up to max_neighbors
+        L          = input_ids.shape[0]
 
-        all_input_ids      = []
-        all_attention_masks = []
+        # Pad agent_token_positions to max_total slots (extras map to position 0)
+        while len(agent_token_positions) < max_total:
+            agent_token_positions.append(0)
+        agent_positions = torch.tensor(agent_token_positions[:max_total], dtype=torch.long)  # [N]
 
-        for prompt_text, _ in agent_prompts:
-            enc = self.tokenizer(
-                prompt_text, truncation=True, max_length=L,
-                padding="max_length", return_tensors="pt"
-            )
-            all_input_ids.append(enc["input_ids"].squeeze(0))        # [L]
-            all_attention_masks.append(enc["attention_mask"].squeeze(0))  # [L]
-
-        # Pad missing agent slots with dummy tensors (attention_mask[0]=1 avoids
-        # all-zero mask NaN in the LLM; agent_valid will be False for these slots)
-        while len(all_input_ids) < max_total:
-            dummy_ids  = torch.zeros(L, dtype=torch.long)
-            dummy_mask = torch.zeros(L, dtype=torch.long)
-            dummy_mask[0] = 1  # at least one "valid" token to prevent softmax NaN
-            all_input_ids.append(dummy_ids)
-            all_attention_masks.append(dummy_mask)
-
-        input_ids      = torch.stack(all_input_ids[:max_total])        # [N, L]
-        attention_mask = torch.stack(all_attention_masks[:max_total])  # [N, L]
-
-        # GT trajectories — same displacement logic as Exp2
+        # GT trajectories
         trajs_pos = row["TRAJS"]["trajs_pos"]
         has_flags = row["TRAJS"]["has_flags"]
         trajs_cat = row["TRAJS"]["trajs_cat"]
@@ -547,8 +763,8 @@ class AV2PromptDataset(Dataset):
         gt_abs_trajectories = torch.zeros(max_total, 60, 2, dtype=torch.float32)
         gt_anchor           = torch.zeros(max_total, 2,  dtype=torch.float32)
         gt_masks            = torch.zeros(max_total, 60, dtype=torch.bool)
-        agent_valid         = torch.zeros(max_total, dtype=torch.bool)
-        train_mask          = torch.zeros(max_total, dtype=torch.bool)
+        agent_valid         = torch.zeros(max_total,     dtype=torch.bool)
+        train_mask          = torch.zeros(max_total,     dtype=torch.bool)
 
         for a_idx, ag_id in enumerate(written_agent_ids):
             abs_pos = torch.tensor(trajs_pos[ag_id, self.obs_len:, :], dtype=torch.float32)
@@ -570,20 +786,18 @@ class AV2PromptDataset(Dataset):
             gt_abs_trajectories[a_idx] = abs_pos
             gt_anchor[a_idx]           = anchor
             gt_masks[a_idx]            = flags
-            # agent_valid: present in scene (used by social attention for context)
-            agent_valid[a_idx]  = (attention_mask[a_idx].sum() > 1)
-            # train_mask: only focal + scored agents contribute to loss
+            agent_valid[a_idx]         = True
             cat = str(trajs_cat[ag_id])
-            train_mask[a_idx]   = agent_valid[a_idx] and (cat in ('focal', 'score'))
+            train_mask[a_idx]          = (cat in ('focal', 'score'))
 
         return {
-            "input_ids":           input_ids,            # [N, L]  — per-agent sequences
-            "attention_mask":      attention_mask,        # [N, L]
-            "prompt_text":         agent_prompts[0][0],  # str: focal agent prompt (for debug)
-            "gt_trajectories":     gt_trajectories,      # [N, 60, 2] displacement GT
-            "gt_abs_trajectories": gt_abs_trajectories,  # [N, 60, 2] absolute GT
-            "gt_anchor":           gt_anchor,             # [N, 2]
-            "gt_masks":            gt_masks,              # [N, 60]
-            "agent_valid":         agent_valid,           # [N] — social attention mask
-            "train_mask":          train_mask,            # [N] — loss mask (focal+score only)
+            "input_ids":           input_ids,              # [L]   unified scene sequence
+            "attention_mask":      attention_mask,          # [L]
+            "agent_positions":     agent_positions,         # [N]   token index per agent
+            "gt_trajectories":     gt_trajectories,         # [N, 60, 2] displacement GT
+            "gt_abs_trajectories": gt_abs_trajectories,     # [N, 60, 2] absolute GT
+            "gt_anchor":           gt_anchor,               # [N, 2]
+            "gt_masks":            gt_masks,                # [N, 60]
+            "agent_valid":         agent_valid,             # [N]
+            "train_mask":          train_mask,              # [N] loss mask (focal+score only)
         }

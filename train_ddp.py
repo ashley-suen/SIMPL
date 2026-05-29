@@ -13,6 +13,8 @@ DDP-only changes vs train_llm.py:
   8. dist.barrier() at epoch start and before/after validation to keep ranks in sync
 """
 import os
+os.environ.setdefault("USE_LIBUV", "0")   # Windows: TCPStore built without libuv support
+import sys
 import glob
 import time
 import argparse
@@ -30,6 +32,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 
+
 # Disable tokenizers parallelism warning
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -41,16 +44,15 @@ from utils.utils import AverageMeterForDict, set_seed, save_ckpt, distributed_me
 
 
 def dynamic_pad_collate(batch):
-    """Trim input_ids / attention_mask to the longest *real* token in this batch.
-    Cuts wasted attention compute from O(1536²) to O(actual_max²) per batch.
-    All other tensor fields are fixed-size and go through default collate unchanged.
+    """Trim unified input_ids / attention_mask to the longest real token in this batch.
+    input_ids is now [L] per sample (unified scene prompt), not [N, L].
+    agent_positions are clamped to the trimmed length to stay in bounds.
     """
-    # actual max token length across all agents in this batch
-    max_len = max(item["attention_mask"].sum(dim=-1).max().item() for item in batch)
-    max_len = int(max_len)
+    max_len = int(max(item["attention_mask"].sum().item() for item in batch))
     for item in batch:
-        item["input_ids"]      = item["input_ids"][:, :max_len]
-        item["attention_mask"] = item["attention_mask"][:, :max_len]
+        item["input_ids"]       = item["input_ids"][:max_len]
+        item["attention_mask"]  = item["attention_mask"][:max_len]
+        item["agent_positions"] = item["agent_positions"].clamp(0, max_len - 1)
     return torch.utils.data.dataloader.default_collate(batch)
 
 
@@ -64,8 +66,13 @@ def parse_arguments():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--logger_writer", action="store_true", help="Enable tensorboard")
     parser.add_argument("--no_pbar", action="store_true", help="Hide progress bar")
+    parser.add_argument("--max_train_samples", type=int, default=0,
+                        help="If >0, randomly subsample training set to this many samples "
+                             "(fixed by --seed for reproducibility). 0 = use full dataset.")
 
     # LLM Specific Args
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B-Base",
+                        help="HuggingFace model ID for the LLM backbone and tokenizer.")
     parser.add_argument("--llm_lr", type=float, default=1e-5, help="Learning rate for LLM layers")
     parser.add_argument("--gru_lr", type=float, default=1e-4, help="Learning rate for GRU decoder and social attention")
     parser.add_argument("--unfreeze_layers", type=int, default=1, help="Number of LLM layers to unfreeze")
@@ -73,6 +80,10 @@ def parse_arguments():
     # Loss
     parser.add_argument("--soft_wta_alpha", type=float, default=0.1,
                         help="Soft WTA weight for non-winner modes (0.0 = hard WTA, not recommended).")
+    parser.add_argument("--endpoint_weight", type=float, default=0.2,
+                        help="Weight for endpoint-consistency auxiliary loss. "
+                             "Penalises predicting stationary motion for moving agents. "
+                             "0.0 disables it. Recommended: 0.1-0.3.")
 
     # LR Scheduler
     parser.add_argument("--scheduler", type=str, default="cosine_warmup_restart",
@@ -128,19 +139,37 @@ def parse_arguments():
                         help="Minimum minADE improvement (m) to count as progress for early stopping.")
 
     # Sequence length
-    parser.add_argument("--max_seq_len", type=int, default=1536,
-                        help="Max token length per agent prompt (padding target). "
-                             "Audit shows actual max=1393 with traj_step=1, so 1536 is lossless.")
+    parser.add_argument("--max_seq_len", type=int, default=8192,
+                        help="Max token length for the unified scene prompt. "
+                             "Worst case (6 agents × 50 steps) ~5050 tokens; 8192 is safe. "
+                             "Qwen3-0.6B supports 40k context.")
 
     # torch.compile
     parser.add_argument("--compile", action="store_true",
                         help="Wrap model with torch.compile after DDP for extra speed. "
-                             "First iteration will be slow (3-10 min compilation).")
+                             "First iteration will be slow (compilation).")
+    parser.add_argument("--compile_mode", type=str, default="default",
+                        choices=["default", "reduce-overhead", "max-autotune",
+                                 "max-autotune-no-cudagraphs"],
+                        help="torch.compile mode. "
+                             "'max-autotune-no-cudagraphs' (default): full kernel autotuning "
+                             "without CUDA Graphs — required when using Flash Attention 2, "
+                             "which uses torch.nonzero (data-dependent output) incompatible with CUDA Graphs. "
+                             "'max-autotune': adds CUDA Graphs on top, crashes with Flash Attention. "
+                             "'reduce-overhead': moderate speedup, still uses CUDA Graphs. "
+                             "'default': no CUDA Graphs, safe but least optimized.")
+
+    # Flash Attention
+    parser.add_argument("--flash_attn", action="store_true",
+                        help="Enable Flash Attention 2 in the LLM backbone. "
+                             "Requires flash-attn package (pip install flash-attn --no-build-isolation). "
+                             "Recommended for Hopper/Ampere GPUs (H800, A100). "
+                             "Do NOT use on Blackwell (RTX 5090/sm_120) — conflicts with NCCL.")
 
     # DDP backend
     parser.add_argument("--dist_backend", type=str, default="gloo",
                         choices=["gloo", "nccl"],
-                        help="DDP backend. Use 'nccl' on Linux/Ada+ GPUs for best performance. "
+                        help="DDP backend. Use 'nccl' on Linux/Hopper/Ampere GPUs for best performance. "
                              "Default 'gloo' for Windows/Blackwell (sm_120) compatibility.")
 
     return parser.parse_args()
@@ -149,11 +178,33 @@ def parse_arguments():
 def format_lr(optimizer):
     """Format current LRs of each param group as a readable string."""
     parts = []
-    names = ["llm", "social", "gru"]
+    names = ["llm", "gru"]
     for i, pg in enumerate(optimizer.param_groups):
         name = names[i] if i < len(names) else f"g{i}"
         parts.append(f"{name}_lr={pg['lr']:.2e}")
     return ", ".join(parts)
+
+
+def detect_gpu_config():
+    """
+    Detect GPU architecture and return compatibility info.
+
+    SM version map (relevant):
+      sm80  → Ampere  (A100, A30)                — flash attn ✅
+      sm86  → Ampere  (RTX 3090, A40)            — flash attn ✅
+      sm89  → Ada     (RTX 4090, RTX Pro 6000 Ada) — flash attn ✅
+      sm90  → Hopper  (H100, H800)               — flash attn ✅
+      sm120 → Blackwell (RTX 5090, RTX Pro 6000 Blackwell) — flash attn ❌
+
+    Returns: (sm, gpu_name, flash_attn_ok)
+    """
+    if not torch.cuda.is_available():
+        return 0, "no GPU", False
+    major, minor = torch.cuda.get_device_capability()
+    sm = major * 10 + minor
+    name = torch.cuda.get_device_name()
+    flash_ok = sm >= 80   # Ampere and above; let flash-attn itself report if unsupported
+    return sm, name, flash_ok
 
 
 def count_trainable_params(model):
@@ -182,6 +233,8 @@ def safe_save(logger, model, optimizer, epoch, dirpath, name):
 
 
 def main():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     # ------ DDP initialisation ------
     local_rank  = int(os.environ["LOCAL_RANK"])
     global_rank = int(os.environ.get("RANK", "0"))
@@ -204,14 +257,22 @@ def main():
     logger = Logger(date_str=date_str, enable=is_main, log_dir=log_dir,
                     enable_flags={'writer': args.logger_writer})
 
-    # Always use Gloo: NCCL causes illegal memory access on both Blackwell (sm_120)
-    # and RTX 6000 setups. Overhead is negligible — only 5.3M trainable params (~10MB grad).
-    os.environ["GLOO_SOCKET_IFNAME"] = "eth0"
+    # Detect GPU before init_process_group so we can auto-switch backend if needed
+    sm, gpu_name, flash_ok = detect_gpu_config()
+
+    # Blackwell (sm120+) cannot use NCCL — force gloo regardless of user flag
+    if sm >= 100 and args.dist_backend == "nccl":
+        print(f"[Rank {global_rank}] Blackwell sm{sm} ({gpu_name}) detected — "
+              f"NCCL causes illegal memory access on sm120; forcing dist_backend: nccl → gloo")
+        args.dist_backend = "gloo"
+
+    if sys.platform != "win32":
+        os.environ["GLOO_SOCKET_IFNAME"] = "eth0"   # Linux only — not valid on Windows
     os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
     os.environ["GLOO_SOCKET_NTHREADS"] = "8"
-    os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"  # suppress background NCCL watchdog if any
-    dist.init_process_group(backend="gloo", timeout=datetime.timedelta(minutes=30))
-    logger.print(f"Using GLOO backend | world_size={world_size} | rank={global_rank}")
+    dist.init_process_group(backend=args.dist_backend, timeout=datetime.timedelta(minutes=30),
+                            device_id=device)
+    logger.print(f"DDP backend={args.dist_backend} | world_size={world_size} | rank={global_rank}")
 
     if is_main:
         logger.log_basics(args=args, datetime=date_str)
@@ -243,10 +304,21 @@ def main():
     val_dir = os.path.join(args.features_dir, 'val')
 
     logger.print(f"Loading datasets from {train_dir} and {val_dir}...")
-    train_set = AV2PromptDataset(train_dir, max_len_per_agent=args.max_seq_len)
-    val_set   = AV2PromptDataset(val_dir,   max_len_per_agent=args.max_seq_len)
-    logger.print(f"Train samples: {len(train_set)} | Val samples: {len(val_set)} "
-                 f"| max_seq_len={args.max_seq_len}")
+    train_set = AV2PromptDataset(train_dir, tokenizer_name=args.model_name,
+                                 max_len_per_agent=args.max_seq_len)
+    val_set   = AV2PromptDataset(val_dir,   tokenizer_name=args.model_name,
+                                 max_len_per_agent=args.max_seq_len)
+    full_train_set  = train_set   # keep reference for per-epoch resampling
+    full_train_size = len(train_set)
+    use_subset      = args.max_train_samples > 0 and full_train_size > args.max_train_samples
+
+    if use_subset:
+        logger.print(f"Train samples: {args.max_train_samples} / {full_train_size} "
+                     f"(re-sampled each epoch) | Val samples: {len(val_set)} "
+                     f"| max_seq_len={args.max_seq_len}")
+    else:
+        logger.print(f"Train samples: {full_train_size} | Val samples: {len(val_set)} "
+                     f"| max_seq_len={args.max_seq_len}")
 
     if is_main and len(val_set) == 0:
         raise RuntimeError(
@@ -254,27 +326,41 @@ def main():
             f"Best-checkpoint logic cannot work — aborting."
         )
 
-    # DDP: DistributedSampler replaces shuffle=True
-    train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=global_rank, shuffle=True)
-    val_sampler   = DistributedSampler(val_set,   num_replicas=world_size, rank=global_rank, shuffle=False)
+    val_sampler = DistributedSampler(val_set, num_replicas=world_size, rank=global_rank, shuffle=False)
+    persistent  = args.num_workers > 0
+    dl_val = DataLoader(val_set, batch_size=args.val_batch_size, sampler=val_sampler,
+                        num_workers=args.num_workers, pin_memory=True,
+                        persistent_workers=persistent, collate_fn=dynamic_pad_collate)
 
-    # persistent_workers requires num_workers > 0
-    persistent = args.num_workers > 0
-    dl_train = DataLoader(train_set, batch_size=args.train_batch_size, sampler=train_sampler,
-                          num_workers=args.num_workers, pin_memory=True,
-                          persistent_workers=persistent, collate_fn=dynamic_pad_collate)
-    dl_val   = DataLoader(val_set,   batch_size=args.val_batch_size,   sampler=val_sampler,
-                          num_workers=args.num_workers, pin_memory=True,
-                          persistent_workers=persistent, collate_fn=dynamic_pad_collate)
+    # dl_train is built per-epoch when use_subset=True; build once here for the no-subset case
+    if not use_subset:
+        train_sampler = DistributedSampler(full_train_set, num_replicas=world_size,
+                                           rank=global_rank, shuffle=True)
+        dl_train = DataLoader(full_train_set, batch_size=args.train_batch_size,
+                              sampler=train_sampler, num_workers=args.num_workers,
+                              pin_memory=True, persistent_workers=persistent,
+                              collate_fn=dynamic_pad_collate)
+    else:
+        train_sampler = None   # will be created per epoch
+        dl_train      = None
 
-    iters_per_epoch = len(dl_train)
     val_iters = len(dl_val)
-    logger.print(f"Iterations per epoch (per GPU): train={iters_per_epoch}, val={val_iters}")
+    iters_per_epoch = (args.max_train_samples // (args.train_batch_size * world_size)
+                       if use_subset else len(dl_train))
+    logger.print(f"Iterations per epoch (per GPU): train≈{iters_per_epoch}, val={val_iters}")
 
-    # flash-attn custom CUDA kernels conflict with NCCL's memory on RTX 5090 (Blackwell/sm_120)
-    # regardless of backend — always use sdpa in DDP context.
-    use_flash_attn = False
-    logger.print("Flash Attention 2: Disabled (using SDPA — flash-attn conflicts with DDP on sm_120)")
+    logger.print(f"GPU: {gpu_name}  |  SM={sm}  |  flash_attn_compatible={flash_ok}")
+
+    use_flash_attn = args.flash_attn
+    if use_flash_attn and not flash_ok:
+        logger.print(
+            f"WARNING: GPU sm{sm} ({gpu_name}) may not support flash_attn — "
+            f"proceeding anyway, will crash at runtime if unsupported."
+        )
+    if use_flash_attn:
+        logger.print(f"Flash Attention 2: Enabled (sm{sm})")
+    else:
+        logger.print(f"Flash Attention 2: Disabled (using SDPA)")
     
     # DDP workaround: use file-based synchronization to avoid concurrent model loading.
     import time
@@ -286,6 +372,7 @@ def main():
             f.write(str(os.getpid()))
         
         model = SmolLMMotionPredictor(
+            model_name=args.model_name,
             unfreeze_last_n_layers=args.unfreeze_layers,
             num_modes=args.num_modes,
             device=None,
@@ -305,6 +392,7 @@ def main():
             raise RuntimeError(f"Rank {global_rank} timed out waiting for rank 0 to load model")
         time.sleep(1)
         model = SmolLMMotionPredictor(
+            model_name=args.model_name,
             unfreeze_last_n_layers=args.unfreeze_layers,
             num_modes=args.num_modes,
             device=None,
@@ -317,12 +405,13 @@ def main():
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     if args.compile:
-        model = torch.compile(model, mode="default")
-        logger.print("torch.compile enabled (mode=default) — first iter ~3-10 min")
+        model = torch.compile(model, mode=args.compile_mode, dynamic=False)
+        logger.print(f"torch.compile enabled (mode={args.compile_mode}, dynamic=True)")
 
-    loss_fn = LLMMotionLoss(device=device, soft_wta_alpha=args.soft_wta_alpha)
+    loss_fn = LLMMotionLoss(device=device, soft_wta_alpha=args.soft_wta_alpha,
+                            endpoint_weight=args.endpoint_weight)
     if is_main:
-        logger.print(f"Loss: FDE-WTA SmoothL1 on displacement space (detached cumsum for winner) | "
+        logger.print(f"Loss: disp-space SmoothL1 + endpoint consistency (w={args.endpoint_weight}) | "
                      f"Soft WTA alpha={args.soft_wta_alpha} (winner=1.0, others={args.soft_wta_alpha})")
 
         n_trainable, n_total = count_trainable_params(model)
@@ -331,19 +420,16 @@ def main():
 
     # 3. Optimizer (Differential Learning Rates)
     # DDP prefixes names with "module." — use substring match instead of startswith
-    llm_params    = [p for n, p in model.named_parameters() if p.requires_grad and "llm." in n]
-    gru_params    = [p for n, p in model.named_parameters() if p.requires_grad and "gru_decoder." in n]
-    social_params = [p for n, p in model.named_parameters() if p.requires_grad and "social_attn." in n]
+    llm_params = [p for n, p in model.named_parameters() if p.requires_grad and "llm." in n]
+    gru_params = [p for n, p in model.named_parameters() if p.requires_grad and "llm." not in n]
 
     if is_main:
-        logger.print(f"Trainable groups: llm_params={sum(p.numel() for p in llm_params):,}, "
-                     f"social_params={sum(p.numel() for p in social_params):,}, "
-                     f"gru_params={sum(p.numel() for p in gru_params):,}")
+        logger.print(f"Trainable groups: llm={sum(p.numel() for p in llm_params):,} params "
+                     f"| gru_decoder={sum(p.numel() for p in gru_params):,} params")
 
     optimizer = AdamW([
-        {'params': llm_params,    'lr': args.llm_lr},
-        {'params': social_params, 'lr': args.gru_lr},
-        {'params': gru_params,    'lr': args.gru_lr},
+        {'params': llm_params, 'lr': args.llm_lr},
+        {'params': gru_params, 'lr': args.gru_lr},
     ], weight_decay=1e-4)
 
     # --- LR Scheduler ---
@@ -367,7 +453,7 @@ def main():
             logger.print(f"Scheduler: CosineWarmupRestart | T_0={_T0}, "
                          f"warmup={_wu} epochs, eta_min_ratio={_r} "
                          f"(floor={args.llm_lr * _r:.2e} for llm, "
-                         f"{args.gru_lr * _r:.2e} for gru/social)")
+                         f"{args.gru_lr * _r:.2e} for gru)")
     elif args.scheduler == "cosine_restart":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=args.T_0, T_mult=args.T_mult
@@ -409,7 +495,7 @@ def main():
                          f"LR after fast-forward: {format_lr(optimizer)}")
 
     # 5. Training Loop
-    niter = start_epoch * args.train_batch_size * world_size * len(dl_train)
+    niter = start_epoch * args.train_batch_size * world_size * iters_per_epoch
     best_val_loss = float('inf')
     best_minADE   = float('inf')
     patience_counter = 0
@@ -428,6 +514,21 @@ def main():
         # FIX: sync all ranks at the start of each epoch before any work begins
         dist.barrier()
 
+        # Re-sample a fresh subset each epoch so the model sees different samples every time
+        if use_subset:
+            ep_indices = torch.randperm(
+                full_train_size,
+                generator=torch.Generator().manual_seed(args.seed + epoch)
+            )[:args.max_train_samples].tolist()
+            ep_train_set  = torch.utils.data.Subset(full_train_set, ep_indices)
+            train_sampler = DistributedSampler(ep_train_set, num_replicas=world_size,
+                                               rank=global_rank, shuffle=True)
+            dl_train = DataLoader(ep_train_set, batch_size=args.train_batch_size,
+                                  sampler=train_sampler, num_workers=args.num_workers,
+                                  pin_memory=True, persistent_workers=False,
+                                  collate_fn=dynamic_pad_collate)
+            iters_per_epoch = len(dl_train)
+
         train_sampler.set_epoch(epoch)  # DDP: ensures different shuffle each epoch
 
         if is_main:
@@ -441,7 +542,7 @@ def main():
             logger.print(f'  - AMP (bf16)                : True (weights + autocast)')
             logger.print(f'  - Grad clip max norm        : {args.grad_clip}')
             logger.print(f'  - Max seq len               : {args.max_seq_len}')
-            logger.print(f'  - torch.compile             : {args.compile}')
+            logger.print(f'  - torch.compile             : {args.compile} (mode={args.compile_mode})')
             logger.print('=' * 80)
 
         torch.cuda.empty_cache()
@@ -458,14 +559,15 @@ def main():
                     desc=f"[Train ep {epoch + 1}]")
 
         for i, data in enumerate(pbar):
-            input_ids      = data["input_ids"].to(device)       # [B, N, L]
-            attention_mask = data["attention_mask"].to(device)   # [B, N, L]
-            agent_valid    = data["agent_valid"].to(device)      # [B, N]
+            input_ids       = data["input_ids"].to(device)        # [B, L]
+            attention_mask  = data["attention_mask"].to(device)    # [B, L]
+            agent_positions = data["agent_positions"].to(device)   # [B, N]
+            agent_valid     = data["agent_valid"].to(device)       # [B, N]
 
             optimizer.zero_grad()
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                predicted_trajs = model(input_ids, attention_mask, agent_valid)
+                predicted_trajs = model(input_ids, attention_mask, agent_positions, agent_valid)
                 loss_out = loss_fn(predicted_trajs, data)
 
             loss = loss_out["loss"]
@@ -548,12 +650,13 @@ def main():
 
             with torch.no_grad():
                 for i, data in enumerate(val_pbar):
-                    input_ids      = data["input_ids"].to(device)       # [B, N, L]
-                    attention_mask = data["attention_mask"].to(device)   # [B, N, L]
-                    agent_valid    = data["agent_valid"].to(device)      # [B, N]
+                    input_ids       = data["input_ids"].to(device)        # [B, L]
+                    attention_mask  = data["attention_mask"].to(device)    # [B, L]
+                    agent_positions = data["agent_positions"].to(device)   # [B, N]
+                    agent_valid     = data["agent_valid"].to(device)       # [B, N]
 
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        predicted_trajs = model(input_ids, attention_mask, agent_valid)
+                        predicted_trajs = model(input_ids, attention_mask, agent_positions, agent_valid)
                         loss_out = loss_fn(predicted_trajs, data)
 
                     val_loss_meter.update({k: v.item() for k, v in loss_out.items()})
