@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoConfig
+from peft import LoraConfig, get_peft_model, TaskType
 
 
 class GRUDecoder(nn.Module):
@@ -92,7 +93,10 @@ class UnifiedLLMMotionPredictor(nn.Module):
                  model_name="Qwen/Qwen3-0.6B-Base",
                  num_future_steps=60,
                  num_modes=6,
-                 unfreeze_last_n_layers=2,
+                 lora_r=16,
+                 lora_alpha=32,
+                 lora_target_modules=None,
+                 lora_dropout=0.05,
                  gru_hidden=256,
                  gru_layers=2,
                  device=None,
@@ -113,22 +117,29 @@ class UnifiedLLMMotionPredictor(nn.Module):
             low_cpu_mem_usage=False,
         )
 
-        # Freeze strategy: embeddings frozen, last N transformer layers trainable
-        for param in self.llm.embed_tokens.parameters():
+        # Freeze all LLM weights; LoRA adapters will be the only trainable parts
+        for param in self.llm.parameters():
             param.requires_grad = False
 
-        num_layers    = len(self.llm.layers)
-        frozen_layers = num_layers - unfreeze_last_n_layers
-        for i, layer in enumerate(self.llm.layers):
-            req = (i >= frozen_layers)
-            for param in layer.parameters():
-                param.requires_grad = req
+        if lora_target_modules is None:
+            lora_target_modules = [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ]
 
-        for param in self.llm.norm.parameters():
-            param.requires_grad = True
+        lora_config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=lora_target_modules,
+            lora_dropout=lora_dropout,
+            bias="none",
+            task_type=TaskType.FEATURE_EXTRACTION,
+        )
+        self.llm = get_peft_model(self.llm, lora_config)
 
-        print(f"Loaded {model_name}.")
-        print(f"Total layers: {num_layers}. Frozen: {frozen_layers}, Trainable: {unfreeze_last_n_layers}.")
+        print(f"Loaded {model_name} with LoRA (r={lora_r}, alpha={lora_alpha}, "
+              f"targets={lora_target_modules}).")
+        self.llm.print_trainable_parameters()
 
         hidden_dim = self.config.hidden_size
 
@@ -195,7 +206,7 @@ if __name__ == "__main__":
 
     print("Initializing UnifiedLLMMotionPredictor (Qwen3-0.6B, GRU decoder, K=6 modes)...")
     model = UnifiedLLMMotionPredictor(model_name="Qwen/Qwen3-0.6B-Base",
-                                      num_modes=K, unfreeze_last_n_layers=2)
+                                      num_modes=K, lora_r=16, lora_alpha=32)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())

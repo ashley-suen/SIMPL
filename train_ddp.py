@@ -73,9 +73,17 @@ def parse_arguments():
     # LLM Specific Args
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B-Base",
                         help="HuggingFace model ID for the LLM backbone and tokenizer.")
-    parser.add_argument("--llm_lr", type=float, default=1e-5, help="Learning rate for LLM layers")
-    parser.add_argument("--gru_lr", type=float, default=1e-4, help="Learning rate for GRU decoder and social attention")
-    parser.add_argument("--unfreeze_layers", type=int, default=1, help="Number of LLM layers to unfreeze")
+    parser.add_argument("--llm_lr", type=float, default=1e-5, help="Learning rate for LoRA parameters")
+    parser.add_argument("--gru_lr", type=float, default=1e-4, help="Learning rate for GRU decoder")
+    parser.add_argument("--lora_r",       type=int,   default=16,
+                        help="LoRA rank (default=16)")
+    parser.add_argument("--lora_alpha",   type=int,   default=32,
+                        help="LoRA scaling factor (default=32, i.e. 2×r)")
+    parser.add_argument("--lora_dropout", type=float, default=0.05,
+                        help="LoRA dropout (default=0.05)")
+    parser.add_argument("--lora_targets", type=str,
+                        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+                        help="Comma-separated list of linear module names to apply LoRA to")
 
     # Loss
     parser.add_argument("--soft_wta_alpha", type=float, default=0.1,
@@ -373,7 +381,10 @@ def main():
         
         model = SmolLMMotionPredictor(
             model_name=args.model_name,
-            unfreeze_last_n_layers=args.unfreeze_layers,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_target_modules=args.lora_targets.split(","),
+            lora_dropout=args.lora_dropout,
             num_modes=args.num_modes,
             device=None,
             use_flash_attn=use_flash_attn,
@@ -393,7 +404,10 @@ def main():
         time.sleep(1)
         model = SmolLMMotionPredictor(
             model_name=args.model_name,
-            unfreeze_last_n_layers=args.unfreeze_layers,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_target_modules=args.lora_targets.split(","),
+            lora_dropout=args.lora_dropout,
             num_modes=args.num_modes,
             device=None,
             use_flash_attn=use_flash_attn,
@@ -402,7 +416,8 @@ def main():
         model = model.to(device).to(torch.bfloat16)
     
     dist.barrier()
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                find_unused_parameters=True)
 
     if args.compile:
         model = torch.compile(model, mode=args.compile_mode, dynamic=False)
@@ -537,7 +552,8 @@ def main():
             logger.print(f'  - LR : {format_lr(optimizer)}')
             logger.print(f'  - Batch size (per-GPU/total): {args.train_batch_size}/{args.train_batch_size * world_size}')
             logger.print(f'  - GPUs                      : {world_size}')
-            logger.print(f'  - Unfrozen LLM layers       : {args.unfreeze_layers}')
+            logger.print(f'  - LoRA rank / alpha         : {args.lora_r} / {args.lora_alpha}')
+            logger.print(f'  - LoRA targets              : {args.lora_targets}')
             logger.print(f'  - Prediction modes (K)      : {args.num_modes}')
             logger.print(f'  - AMP (bf16)                : True (weights + autocast)')
             logger.print(f'  - Grad clip max norm        : {args.grad_clip}')
