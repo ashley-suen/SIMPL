@@ -3,6 +3,6 @@
   <component name="VcsDirectoryMappings">
     <mapping directory="" vcs="Git" />
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/LLM_MTR/LLM-Augmented-MTR" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/paper/GameFormer" vcs="Git" />
   </component>
 </project>
