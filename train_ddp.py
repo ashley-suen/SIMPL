@@ -16,6 +16,7 @@ import os
 os.environ.setdefault("USE_LIBUV", "0")   # Windows: TCPStore built without libuv support
 import sys
 import glob
+import contextlib
 import time
 import argparse
 import datetime
@@ -139,6 +140,12 @@ def parse_arguments():
     # Gradient clipping
     parser.add_argument("--grad_clip", type=float, default=1.0,
                         help="Max gradient norm for clip_grad_norm_")
+
+    # Gradient accumulation
+    parser.add_argument("--grad_accum_steps", type=int, default=1,
+                        help="Gradient accumulation steps. "
+                             "Effective batch = train_batch_size × world_size × grad_accum_steps. "
+                             "Use to reduce per-step memory without changing effective batch size.")
 
     # Early stopping
     parser.add_argument("--early_stop_patience", type=int, default=5,
@@ -551,6 +558,7 @@ def main():
             logger.print(f'Epoch {epoch + 1}/{args.train_epoches}')
             logger.print(f'  - LR : {format_lr(optimizer)}')
             logger.print(f'  - Batch size (per-GPU/total): {args.train_batch_size}/{args.train_batch_size * world_size}')
+            logger.print(f'  - Grad accum steps          : {args.grad_accum_steps} (eff. batch={args.train_batch_size * world_size * args.grad_accum_steps})')
             logger.print(f'  - GPUs                      : {world_size}')
             logger.print(f'  - LoRA rank / alpha         : {args.lora_r} / {args.lora_alpha}')
             logger.print(f'  - LoRA targets              : {args.lora_targets}')
@@ -574,24 +582,34 @@ def main():
         pbar = tqdm(dl_train, disable=(not is_main or args.no_pbar), ncols=110,
                     desc=f"[Train ep {epoch + 1}]")
 
+        accum        = args.grad_accum_steps
+        grad_norm    = torch.tensor(0.0)
+        optimizer.zero_grad()
+
         for i, data in enumerate(pbar):
             input_ids       = data["input_ids"].to(device)        # [B, L]
             attention_mask  = data["attention_mask"].to(device)    # [B, L]
             agent_positions = data["agent_positions"].to(device)   # [B, N]
             agent_valid     = data["agent_valid"].to(device)       # [B, N]
 
-            optimizer.zero_grad()
+            is_last_accum = ((i + 1) % accum == 0) or ((i + 1) == iters_per_epoch)
 
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                predicted_trajs = model(input_ids, attention_mask, agent_positions, agent_valid)
-                loss_out = loss_fn(predicted_trajs, data)
+            # Skip DDP gradient sync on non-last accumulation steps
+            sync_ctx = contextlib.nullcontext() if is_last_accum else model.no_sync()
+            with sync_ctx:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    predicted_trajs = model(input_ids, attention_mask, agent_positions, agent_valid)
+                    loss_out = loss_fn(predicted_trajs, data)
 
-            loss = loss_out["loss"]
+                loss = loss_out["loss"] / accum
+                loss.backward()
 
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
-            optimizer.step()
+            if is_last_accum:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+                optimizer.step()
+                optimizer.zero_grad()
 
+            # Logging uses the unscaled loss for readability
             scalar_losses = {k: v.item() for k, v in loss_out.items()}
             train_loss_meter.update(scalar_losses)
             loss_window.append(scalar_losses["loss"])

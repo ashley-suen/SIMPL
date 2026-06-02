@@ -53,10 +53,18 @@ def parse_arguments():
                         help="DataLoader workers. Keep 0 on Windows to avoid spawn issues.")
 
     # Model
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B-Base")
-    parser.add_argument("--unfreeze_layers", type=int, default=1)
-    parser.add_argument("--num_modes",       type=int, default=6)
-    parser.add_argument("--max_seq_len",     type=int, default=8192)
+    parser.add_argument("--model_name",    type=str, default="Qwen/Qwen3-0.6B-Base")
+    parser.add_argument("--num_modes",     type=int, default=6)
+    parser.add_argument("--max_seq_len",   type=int, default=1024,
+                        help="Reduce to 1024-2048 on 8GB GPUs to keep activation memory in check.")
+    parser.add_argument("--max_train_samples", type=int, default=0,
+                        help="If >0, only use first N training scenes (quick smoke-test).")
+    # LoRA
+    parser.add_argument("--lora_r",       type=int,   default=16)
+    parser.add_argument("--lora_alpha",   type=int,   default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--lora_targets", type=str,
+                        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
 
     # Loss
     parser.add_argument("--soft_wta_alpha",  type=float, default=0.1)
@@ -113,6 +121,8 @@ def main():
         tokenizer_name=args.model_name,
         max_len_per_agent=args.max_seq_len,
     )
+    if args.max_train_samples > 0:
+        train_set = torch.utils.data.Subset(train_set, range(min(args.max_train_samples, len(train_set))))
     logger.print(f"Train: {len(train_set)} scenes | Val: {len(val_set)} scenes | "
                  f"max_seq_len={args.max_seq_len}")
 
@@ -126,7 +136,10 @@ def main():
     # ── Model ─────────────────────────────────────────────────────────────────
     model = UnifiedLLMMotionPredictor(
         model_name=args.model_name,
-        unfreeze_last_n_layers=args.unfreeze_layers,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_target_modules=args.lora_targets.split(","),
+        lora_dropout=args.lora_dropout,
         num_modes=args.num_modes,
         device=device,
         use_flash_attn=False,
@@ -146,9 +159,9 @@ def main():
 
     # ── Optimiser (differential LR) ───────────────────────────────────────────
     llm_params = [p for n, p in model.named_parameters()
-                  if p.requires_grad and n.startswith("llm.")]
+                  if p.requires_grad and "llm." in n]
     gru_params = [p for n, p in model.named_parameters()
-                  if p.requires_grad and not n.startswith("llm.")]
+                  if p.requires_grad and "llm." not in n]
     optimizer = AdamW([
         {"params": llm_params, "lr": args.llm_lr},
         {"params": gru_params, "lr": args.gru_lr},
