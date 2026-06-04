@@ -1,0 +1,1 @@
+- [TODO: remove detach for end-to-end](todo-remove-detach-end2end.md) — planned high-ROI change to co-train encoder+LLM, do after #1/#3/#4

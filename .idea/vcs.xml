@@ -4,6 +4,9 @@
     <mapping directory="" vcs="Git" />
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/paper/GameFormer" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/paper/LMTrajectory" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/paper/MTR" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/paper/Traj-LLM" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/paper/iMotion-LLM" vcs="Git" />
   </component>
 </project>

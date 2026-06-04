@@ -1,0 +1,659 @@
+"""
+Multi-GPU DDP training script for the Hybrid LLM Motion Predictor.
+
+Architecture: Hybrid Token (semantic text + numerical embedding) +
+              Level-k Interaction Decoding (GameFormer-style).
+
+Launch:
+    torchrun --nproc_per_node=4 train_hybrid.py --features_dir data_av2/features [options]
+"""
+import os
+os.environ.setdefault("USE_LIBUV", "0")
+import sys
+import glob
+import time
+import argparse
+import contextlib
+import datetime
+import math
+from datetime import datetime as dt
+from collections import deque
+from tqdm import tqdm
+
+import torch
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.optim import AdamW
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+from data_av2.av2_hybrid_dataset import AV2HybridDataset
+from simpl.hybrid_llm_model import HybridLLMPredictor
+from simpl.hybrid_loss import HybridMotionLoss
+from utils.logger import Logger
+from utils.utils import AverageMeterForDict, set_seed, save_ckpt, distributed_mean
+
+
+# ── Collate ───────────────────────────────────────────────────────────────────
+
+def hybrid_collate_fn(batch):
+    """
+    Pads text_input_ids / text_attention_mask to the longest text in the batch.
+    All other fields are fixed-size and handled by default_collate.
+    """
+    max_len = max(item["text_input_ids"].shape[0] for item in batch)
+    for item in batch:
+        cur = item["text_input_ids"].shape[0]
+        pad = max_len - cur
+        if pad > 0:
+            item["text_input_ids"]      = F.pad(item["text_input_ids"],      (0, pad), value=0)
+            item["text_attention_mask"] = F.pad(item["text_attention_mask"], (0, pad), value=0)
+    return torch.utils.data.dataloader.default_collate(batch)
+
+
+# ── Arguments ─────────────────────────────────────────────────────────────────
+
+def parse_arguments():
+    parser = argparse.ArgumentParser()
+
+    # Paths
+    parser.add_argument("--features_dir", required=True, type=str)
+    parser.add_argument("--ckpt_dir",     type=str, default="saved_models/")
+    parser.add_argument("--exp_name",     type=str, default="hybrid_ddp",
+                        help="Experiment name; logs go to log/{exp_name}/")
+
+    # Dataset
+    parser.add_argument("--max_text_len", type=int, default=500,
+                        help="Max tokens for the semantic text portion (no coord steps)")
+    parser.add_argument("--max_agents",   type=int, default=6)
+    parser.add_argument("--max_lanes",    type=int, default=20)
+
+    # Training
+    parser.add_argument("--train_batch_size",   type=int, default=4)
+    parser.add_argument("--val_batch_size",     type=int, default=8)
+    parser.add_argument("--train_epoches",      type=int, default=64)
+    parser.add_argument("--val_interval",       type=int, default=1)
+    parser.add_argument("--seed",               type=int, default=42)
+    parser.add_argument("--num_workers",        type=int, default=4)
+    parser.add_argument("--max_train_samples",  type=int, default=0)
+    parser.add_argument("--logger_writer",      action="store_true")
+    parser.add_argument("--no_pbar",            action="store_true")
+
+    # Model
+    parser.add_argument("--model_name",  type=str, default="Qwen/Qwen3-0.6B-Base")
+    parser.add_argument("--num_modes",   type=int, default=6)
+    parser.add_argument("--n_levels",    type=int, default=2,
+                        help="Number of Level-k interaction refinement rounds")
+
+    # LoRA
+    parser.add_argument("--lora_r",       type=int,   default=16)
+    parser.add_argument("--lora_alpha",   type=int,   default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--lora_targets", type=str, default="all-linear",
+                        help="LoRA target modules. 'all-linear' (default) targets every "
+                             "nn.Linear in the LLM automatically. Pass a comma-separated "
+                             "list (e.g. 'q_proj,v_proj') for selective targeting.")
+
+    # Loss
+    parser.add_argument("--soft_wta_alpha",  type=float, default=0.1)
+    parser.add_argument("--endpoint_weight", type=float, default=0.2)
+    parser.add_argument("--cls_weight",      type=float, default=0.5,
+                        help="Weight for scene-level mode-classification loss "
+                             "(supervises per-mode confidence; needed for brierMinFDE)")
+
+    # Optimiser
+    parser.add_argument("--llm_lr",    type=float, default=5e-5)
+    parser.add_argument("--gru_lr",    type=float, default=1e-4)
+    parser.add_argument("--grad_clip",     type=float, default=5.0,
+                        help="Gradient clip for encoder+decoder params (GameFormer uses 5.0)")
+    parser.add_argument("--llm_grad_clip", type=float, default=1.0,
+                        help="Gradient clip for LLM LoRA params (separate from encoder)")
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
+
+    # Scheduler
+    parser.add_argument("--scheduler",      type=str, default="cosine_warmup_restart",
+                        choices=["cosine", "cosine_restart", "cosine_warmup_restart"])
+    parser.add_argument("--T_0",            type=int,   default=20)
+    parser.add_argument("--T_mult",         type=int,   default=1)
+    parser.add_argument("--warmup_epochs",  type=int,   default=2)
+    parser.add_argument("--eta_min_ratio",  type=float, default=0.1)
+
+    # Logging / saving
+    parser.add_argument("--print_interval",       type=int, default=100)
+    parser.add_argument("--running_window",        type=int, default=50)
+    parser.add_argument("--save_last_every_epoch", action="store_true", default=True)
+
+    # Resume
+    parser.add_argument("--resume_from",    type=str, default="")
+    parser.add_argument("--resume_epoch",   type=int, default=0)
+    parser.add_argument("--reset_optimizer",action="store_true")
+
+    # Hardware
+    parser.add_argument("--flash_attn",    action="store_true")
+    parser.add_argument("--compile",       action="store_true")
+    parser.add_argument("--compile_mode",  type=str, default="default",
+                        choices=["default", "reduce-overhead",
+                                 "max-autotune", "max-autotune-no-cudagraphs"])
+    parser.add_argument("--dist_backend",  type=str, default="gloo",
+                        choices=["gloo", "nccl"])
+
+    # Early stopping
+    parser.add_argument("--early_stop_patience",  type=int,   default=5)
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.001)
+
+
+    return parser.parse_args()
+
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+
+def format_lr(optimizer):
+    parts = []
+    names = ["llm", "enc+dec"]
+    for i, pg in enumerate(optimizer.param_groups):
+        name = names[i] if i < len(names) else f"g{i}"
+        parts.append(f"{name}_lr={pg['lr']:.2e}")
+    return ", ".join(parts)
+
+
+def detect_gpu_config():
+    if not torch.cuda.is_available():
+        return 0, "no GPU", False
+    major, minor = torch.cuda.get_device_capability()
+    sm = major * 10 + minor
+    return sm, torch.cuda.get_device_name(), sm >= 80
+
+
+def safe_save(logger, model, optimizer, epoch, dirpath, name):
+    try:
+        raw = model.module if isinstance(model, DDP) else model
+        save_ckpt(raw, optimizer, epoch, dirpath, name)
+        full = os.path.join(dirpath, name)
+        if os.path.exists(full):
+            logger.print(f"  >> Saved {full} ({os.path.getsize(full)/1024**2:.1f} MB)")
+        return True
+    except Exception as e:
+        logger.print(f"  !! save_ckpt FAILED for {name}: {e}")
+        return False
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    local_rank  = int(os.environ["LOCAL_RANK"])
+    global_rank = int(os.environ.get("RANK", "0"))
+    world_size  = int(os.environ.get("WORLD_SIZE", "1"))
+
+    torch.cuda.set_device(local_rank)
+    device  = torch.device(f"cuda:{local_rank}")
+    is_main = (global_rank == 0)
+
+    args = parse_arguments()
+    set_seed(args.seed + global_rank)
+
+    date_str = dt.now().strftime("%Y%m%d-%H%M%S")
+    logger   = Logger(date_str=date_str, enable=is_main,
+                      log_dir=f"log/{args.exp_name}",
+                      enable_flags={"writer": args.logger_writer})
+
+    sm, gpu_name, flash_ok = detect_gpu_config()
+    if sm >= 100 and args.dist_backend == "nccl":
+        # Blackwell (sm>=100) is supported by NCCL>=2.21 / PyTorch>=2.5.
+        # Allow NCCL unless the user explicitly requests gloo.
+        print(f"[Rank {global_rank}] Blackwell sm{sm} — using NCCL backend")
+
+    if args.dist_backend == "gloo":
+        if sys.platform != "win32":
+            os.environ["GLOO_SOCKET_IFNAME"] = "eth0"
+        os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
+        os.environ["GLOO_SOCKET_NTHREADS"]  = "8"
+    dist.init_process_group(backend=args.dist_backend,
+                            timeout=datetime.timedelta(minutes=30),
+                            device_id=device)
+
+    logger.print(f"DDP backend={args.dist_backend} | world_size={world_size} | rank={global_rank}")
+
+    if is_main:
+        logger.log_basics(args=args, datetime=date_str)
+        os.makedirs(args.ckpt_dir, exist_ok=True)
+        probe = os.path.join(args.ckpt_dir, f".write_probe_{date_str}")
+        with open(probe, "w") as f: f.write("ok")
+        os.remove(probe)
+
+    # ── 1. Dataset ────────────────────────────────────────────────────────────
+    train_dir = os.path.join(args.features_dir, "train")
+    val_dir   = os.path.join(args.features_dir, "val")
+
+    train_set = AV2HybridDataset(
+        train_dir, tokenizer_name=args.model_name,
+        max_agents=args.max_agents, max_lanes=args.max_lanes,
+        max_text_len=args.max_text_len)
+    val_set   = AV2HybridDataset(
+        val_dir, tokenizer_name=args.model_name,
+        max_agents=args.max_agents, max_lanes=args.max_lanes,
+        max_text_len=args.max_text_len)
+
+    full_train_set  = train_set
+    full_train_size = len(train_set)
+    use_subset = args.max_train_samples > 0 and full_train_size > args.max_train_samples
+    logger.print(f"Train: {full_train_size} | Val: {len(val_set)} | "
+                 f"max_text_len={args.max_text_len} | max_agents={args.max_agents} "
+                 f"| max_lanes={args.max_lanes}")
+
+    persistent = args.num_workers > 0
+    val_sampler = DistributedSampler(val_set, num_replicas=world_size,
+                                     rank=global_rank, shuffle=False)
+    dl_val = DataLoader(val_set, batch_size=args.val_batch_size, sampler=val_sampler,
+                        num_workers=args.num_workers, pin_memory=True,
+                        persistent_workers=persistent, collate_fn=hybrid_collate_fn)
+
+    if not use_subset:
+        train_sampler = DistributedSampler(full_train_set, num_replicas=world_size,
+                                           rank=global_rank, shuffle=True)
+        dl_train = DataLoader(full_train_set, batch_size=args.train_batch_size,
+                              sampler=train_sampler, num_workers=args.num_workers,
+                              pin_memory=True, persistent_workers=persistent,
+                              collate_fn=hybrid_collate_fn)
+    else:
+        train_sampler = dl_train = None
+
+    iters_per_epoch = (args.max_train_samples // (args.train_batch_size * world_size)
+                       if use_subset else len(dl_train))
+    logger.print(f"GPU: {gpu_name} SM={sm} | flash_attn_compat={flash_ok}")
+
+    # ── 2. Model ──────────────────────────────────────────────────────────────
+    use_flash_attn = args.flash_attn
+    if use_flash_attn and not flash_ok:
+        logger.print(f"WARNING: sm{sm} may not support flash_attn — proceeding anyway")
+
+    import time as _time
+    lock_file = "/tmp/simpl_hybrid_model_load.lock"
+
+    if global_rank == 0:
+        with open(lock_file, "w") as f: f.write(str(os.getpid()))
+        model = HybridLLMPredictor(
+            model_name=args.model_name,
+            lora_r=args.lora_r, lora_alpha=args.lora_alpha,
+            lora_target_modules=args.lora_targets if args.lora_targets == "all-linear"
+                                else args.lora_targets.split(","),
+            lora_dropout=args.lora_dropout,
+            n_levels=args.n_levels,
+            max_agents=args.max_agents, max_lanes=args.max_lanes,
+            num_modes=args.num_modes,
+            use_flash_attn=use_flash_attn, dtype=torch.bfloat16)
+        model = model.to(device).to(torch.bfloat16)
+        if os.path.exists(lock_file): os.remove(lock_file)
+    else:
+        waited = 0
+        while os.path.exists(lock_file) and waited < 300:
+            _time.sleep(0.5); waited += 0.5
+        _time.sleep(1)
+        model = HybridLLMPredictor(
+            model_name=args.model_name,
+            lora_r=args.lora_r, lora_alpha=args.lora_alpha,
+            lora_target_modules=args.lora_targets if args.lora_targets == "all-linear"
+                                else args.lora_targets.split(","),
+            lora_dropout=args.lora_dropout,
+            n_levels=args.n_levels,
+            max_agents=args.max_agents, max_lanes=args.max_lanes,
+            num_modes=args.num_modes,
+            use_flash_attn=use_flash_attn, dtype=torch.bfloat16)
+        model = model.to(device).to(torch.bfloat16)
+
+    dist.barrier()
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                find_unused_parameters=True)
+
+    if args.compile:
+        model = torch.compile(model, mode=args.compile_mode, dynamic=False)
+        logger.print(f"torch.compile enabled (mode={args.compile_mode})")
+
+    # ── 3. Loss ───────────────────────────────────────────────────────────────
+    loss_fn = HybridMotionLoss(n_levels=args.n_levels, device=device,
+                               soft_wta_alpha=args.soft_wta_alpha,
+                               endpoint_weight=args.endpoint_weight,
+                               cls_weight=args.cls_weight)
+    if is_main:
+        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in model.parameters())
+        logger.print(f"Params: trainable={n_train:,} / total={n_total:,} "
+                     f"({100.*n_train/max(n_total,1):.2f}%)")
+        logger.print(f"Loss: Level-k HybridMotionLoss | n_levels={args.n_levels} | "
+                     f"weights={loss_fn.level_weights}")
+
+    # ── 4. Optimiser (Differential LR) ────────────────────────────────────────
+    llm_params = [p for n, p in model.named_parameters()
+                  if p.requires_grad and "llm." in n]
+    enc_params = [p for n, p in model.named_parameters()
+                  if p.requires_grad and "llm." not in n]
+    optimizer = AdamW([
+        {"params": llm_params, "lr": args.llm_lr},
+        {"params": enc_params, "lr": args.gru_lr},
+    ], weight_decay=1e-4)
+    logger.print(f"Optimiser: llm_params={sum(p.numel() for p in llm_params):,} "
+                 f"| enc+dec_params={sum(p.numel() for p in enc_params):,}")
+
+    # ── 5. Scheduler ──────────────────────────────────────────────────────────
+    if args.scheduler == "cosine_warmup_restart":
+        _T0, _wu, _r = args.T_0, args.warmup_epochs, args.eta_min_ratio
+        def _lr_lambda(epoch):
+            cp = epoch % _T0
+            if cp < _wu:
+                return _r + (1.0 - _r) * cp / max(1, _wu)
+            prog = (cp - _wu) / max(1, _T0 - _wu)
+            return _r + (1.0 - _r) * 0.5 * (1.0 + math.cos(math.pi * prog))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+        logger.print(f"Scheduler: CosineWarmupRestart T_0={_T0} warmup={_wu} eta_min={_r}")
+    elif args.scheduler == "cosine_restart":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=args.T_0, T_mult=args.T_mult)
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.train_epoches)
+
+    # ── 6. Resume ─────────────────────────────────────────────────────────────
+    start_epoch = 0
+    if args.resume_from:
+        ckpt = torch.load(args.resume_from, map_location={f"cuda:0": f"cuda:{local_rank}"})
+        raw  = model.module if isinstance(model, DDP) else model
+        raw.load_state_dict(ckpt["state_dict"], strict=False)
+        if not args.reset_optimizer:
+            optimizer.load_state_dict(ckpt["opt_state"])
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
+        start_epoch = args.resume_epoch
+        for _ in range(start_epoch): scheduler.step()
+        logger.print(f"Resumed from {args.resume_from} | epoch {start_epoch+1}")
+
+    # ── 7. Training Loop ──────────────────────────────────────────────────────
+    niter         = start_epoch * args.train_batch_size * world_size * iters_per_epoch
+    best_val_loss = float("inf")
+    best_minADE   = float("inf")
+    patience_ctr  = 0
+    should_stop   = torch.zeros(1, dtype=torch.int32, device=device)
+    last_ckpt     = f"{date_str}_hybrid_last.tar"
+    best_ckpt     = f"{date_str}_hybrid_best.tar"
+
+    for epoch in range(start_epoch, args.train_epoches):
+        dist.barrier()
+
+        if use_subset:
+            ep_idx = torch.randperm(
+                full_train_size,
+                generator=torch.Generator().manual_seed(args.seed + epoch)
+            )[:args.max_train_samples].tolist()
+            ep_set  = torch.utils.data.Subset(full_train_set, ep_idx)
+            train_sampler = DistributedSampler(ep_set, num_replicas=world_size,
+                                               rank=global_rank, shuffle=True)
+            dl_train = DataLoader(ep_set, batch_size=args.train_batch_size,
+                                  sampler=train_sampler, num_workers=args.num_workers,
+                                  pin_memory=True, persistent_workers=False,
+                                  collate_fn=hybrid_collate_fn)
+            iters_per_epoch = len(dl_train)
+
+        train_sampler.set_epoch(epoch)
+
+        if is_main:
+            logger.print("\n" + "=" * 80)
+            logger.print(f"Epoch {epoch+1}/{args.train_epoches}")
+            logger.print(f"  - LR              : {format_lr(optimizer)}")
+            logger.print(f"  - Batch (GPU/eff) : {args.train_batch_size} / "
+                         f"{args.train_batch_size * world_size * args.grad_accum_steps}")
+            logger.print(f"  - LoRA r/α        : {args.lora_r}/{args.lora_alpha}")
+            logger.print(f"  - Level-k          : {args.n_levels}")
+            logger.print(f"  - Agents/Lanes     : {args.max_agents}/{args.max_lanes}")
+            logger.print("=" * 80)
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        # ── Train ─────────────────────────────────────────────────────────────
+        model.train()
+        meter       = AverageMeterForDict()
+        loss_window = deque(maxlen=args.running_window)
+        epoch_start = time.time()
+        accum       = args.grad_accum_steps
+        grad_norm_llm = torch.tensor(0.0)
+        grad_norm_enc = torch.tensor(0.0)
+        optimizer.zero_grad()
+
+        pbar = tqdm(dl_train, disable=(not is_main or args.no_pbar),
+                    ncols=120, desc=f"[Train ep {epoch+1}]")
+
+        for i, data in enumerate(pbar):
+            text_ids  = data["text_input_ids"].to(device)
+            text_mask = data["text_attention_mask"].to(device)
+            ag_feat   = data["agent_features"].to(device)
+            ag_valid  = data["agent_valid"].to(device)
+            lane_feat = data["lane_features"].to(device)
+            lane_valid= data["lane_valid"].to(device)
+            gt_anchor = data["gt_anchor"].to(device)
+
+            is_last_accum = ((i + 1) % accum == 0) or ((i + 1) == iters_per_epoch)
+            sync_ctx = contextlib.nullcontext() if is_last_accum else model.no_sync()
+
+            with sync_ctx:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    all_preds, all_scores = model(text_ids, text_mask, ag_feat, ag_valid,
+                                                  lane_feat, lane_valid, gt_anchor)
+                    loss_out  = loss_fn(all_preds, data, all_scores)
+
+                (loss_out["loss"] / accum).backward()
+
+            if is_last_accum:
+                # Separate clipping: LLM LoRA vs encoder+decoder
+                grad_norm_llm = torch.nn.utils.clip_grad_norm_(
+                    llm_params, args.llm_grad_clip)
+                grad_norm_enc = torch.nn.utils.clip_grad_norm_(
+                    enc_params, args.grad_clip)
+                optimizer.step()
+                optimizer.zero_grad()
+
+            scalars = {k: v.item() for k, v in loss_out.items()}
+            meter.update(scalars)
+            loss_window.append(scalars["loss"])
+            niter += args.train_batch_size * world_size
+
+            if is_main:
+                logger.add_dict(scalars, niter, prefix="train/")
+
+            gnorm_llm_val = grad_norm_llm.item() if torch.is_tensor(grad_norm_llm) else float(grad_norm_llm)
+            gnorm_enc_val = grad_norm_enc.item() if torch.is_tensor(grad_norm_enc) else float(grad_norm_enc)
+            running_loss  = sum(loss_window) / len(loss_window)
+            pbar.set_postfix({
+                "loss":   f"{scalars['loss']:.4f}",
+                f"avg{len(loss_window)}": f"{running_loss:.4f}",
+                "gn_enc": f"{gnorm_enc_val:.2f}",
+                "gn_llm": f"{gnorm_llm_val:.2f}",
+            })
+
+            if is_main and ((i+1) % args.print_interval == 0 or (i+1) == iters_per_epoch):
+                elapsed = time.time() - epoch_start
+                ips     = (i+1) / max(elapsed, 1e-6)
+                eta     = (iters_per_epoch - (i+1)) / max(ips, 1e-6)
+                mem     = torch.cuda.memory_allocated(device) // 2**20
+                extra   = " | ".join(f"{k}={v:.4f}" for k, v in scalars.items()
+                                     if k != "loss")
+                logger.print(
+                    f"  [ep {epoch+1} | {i+1}/{iters_per_epoch}] "
+                    f"loss={scalars['loss']:.4f} (avg={running_loss:.4f}) | "
+                    f"{extra} | gn_enc={gnorm_enc_val:.2f} gn_llm={gnorm_llm_val:.2f} | "
+                    f"{ips:.2f} it/s | eta={eta/60:.1f}min | mem={mem}MB"
+                )
+
+        pbar.close()
+        scheduler.step()
+        peak = torch.cuda.max_memory_allocated(device) // 2**20
+        logger.print(f"[Train] ep {epoch+1} avg_loss={meter.metrics['loss'].avg:.4f} | "
+                     f"time={(time.time()-epoch_start)/60:.2f}min | peak_mem={peak}MB")
+
+        if args.save_last_every_epoch and is_main:
+            safe_save(logger, model, optimizer, epoch, args.ckpt_dir, last_ckpt)
+
+        # ── Validation ────────────────────────────────────────────────────────
+        if (epoch + 1) % args.val_interval != 0:
+            continue
+
+        dist.barrier()
+        model.eval()
+        val_meter = AverageMeterForDict()
+        ade_meter = AverageMeterForDict()
+        val_start = time.time()
+
+        val_sampler.set_epoch(epoch)
+
+        pbar_v = tqdm(dl_val, disable=(not is_main or args.no_pbar),
+                      ncols=120, desc=f"[Val   ep {epoch+1}]")
+        with torch.no_grad():
+            for data in pbar_v:
+                text_ids  = data["text_input_ids"].to(device)
+                text_mask = data["text_attention_mask"].to(device)
+                ag_feat   = data["agent_features"].to(device)
+                ag_valid  = data["agent_valid"].to(device)
+                lane_feat = data["lane_features"].to(device)
+                lane_valid= data["lane_valid"].to(device)
+                gt_anchor = data["gt_anchor"].to(device)
+
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    all_preds, all_scores = model(text_ids, text_mask, ag_feat, ag_valid,
+                                                  lane_feat, lane_valid, gt_anchor)
+                    loss_out  = loss_fn(all_preds, data, all_scores)
+
+                val_meter.update({k: v.item() for k, v in loss_out.items()})
+
+                # ── JOINT scene-level avgMinADE / avgMinFDE over ALL scored agents ──
+                # The K modes are K joint "worlds"; one shared mode per scene is
+                # chosen to minimise the joint error, then ADE/FDE is averaged over
+                # scored agents. Matches the AV2 multi-world avgMinADE(K=6) protocol.
+                pred_disp  = all_preds[-1].float()                              # [B, N, K, T, 2]
+                anchor     = gt_anchor.float()                                  # [B, N, 2]
+                pred_abs   = anchor.unsqueeze(2).unsqueeze(2) + \
+                             pred_disp.cumsum(dim=-2)                           # [B, N, K, T, 2]
+                gt_abs_f   = data["gt_abs_trajectories"].to(device).float()     # [B, N, T, 2]
+                gt_masks_f = data["gt_masks"].to(device)                        # [B, N, T]
+                train_m    = data["train_mask"].to(device)                      # [B, N]
+
+                # valid future steps for scored agents only
+                vmask      = (gt_masks_f & train_m.unsqueeze(-1)).float()       # [B, N, T]
+                l2_dist    = (pred_abs - gt_abs_f.unsqueeze(2)).norm(dim=-1)    # [B, N, K, T]
+
+                # per-agent, per-mode ADE (mean over that agent's valid steps)
+                step_cnt     = vmask.sum(dim=-1).clamp(min=1)                   # [B, N]
+                per_mode_ade = (l2_dist * vmask.unsqueeze(2)).sum(dim=-1) \
+                               / step_cnt.unsqueeze(-1)                         # [B, N, K]
+
+                # per-agent, per-mode FDE (at that agent's last valid step)
+                last_t       = (gt_masks_f.long().cumsum(-1) *
+                                gt_masks_f.long()).argmax(-1)                   # [B, N]
+                idx_fde      = last_t.unsqueeze(-1).unsqueeze(-1).expand(
+                                   -1, -1, l2_dist.shape[2], 1)                 # [B, N, K, 1]
+                per_mode_fde = l2_dist.gather(3, idx_fde).squeeze(3)            # [B, N, K]
+
+                # scene-level mode aggregation: average over scored agents
+                scored       = train_m.float()                                 # [B, N]
+                agent_cnt    = scored.sum(dim=1).clamp(min=1)                   # [B]
+                scene_ade    = (per_mode_ade * scored.unsqueeze(-1)).sum(dim=1) \
+                               / agent_cnt.unsqueeze(-1)                        # [B, K]
+                scene_fde    = (per_mode_fde * scored.unsqueeze(-1)).sum(dim=1) \
+                               / agent_cnt.unsqueeze(-1)                        # [B, K]
+
+                # pick the single best joint mode per scene, then average over scenes
+                min_ade = scene_ade.min(dim=1).values.mean()
+                min_fde = scene_fde.min(dim=1).values.mean()
+
+                # ── brierMinFDE: minFDE + (1 - p_best)^2, p_best = predicted prob
+                #    of the oracle min-FDE mode. Scene-level confidence is the
+                #    masked mean of per-agent logits over scored agents.
+                scene_logit = (all_scores[-1].float() * scored.unsqueeze(-1)).sum(dim=1) \
+                              / agent_cnt.unsqueeze(-1)                        # [B, K]
+                scene_prob  = torch.softmax(scene_logit, dim=-1)              # [B, K]
+                best_fde_idx = scene_fde.argmin(dim=1)                        # [B]
+                p_best      = scene_prob.gather(1, best_fde_idx.unsqueeze(1)).squeeze(1)  # [B]
+                brier_fde   = (scene_fde.min(dim=1).values + (1.0 - p_best) ** 2).mean()
+
+                ade_meter.update({"minADE": min_ade.item(), "minFDE": min_fde.item(),
+                                  "brierMinFDE": brier_fde.item()})
+                if is_main:
+                    pbar_v.set_postfix({
+                        "loss":   f"{val_meter.metrics['loss'].avg:.4f}",
+                        "minADE": f"{ade_meter.metrics['minADE'].avg:.4f}",
+                        "minFDE": f"{ade_meter.metrics['minFDE'].avg:.4f}",
+                        "bFDE":   f"{ade_meter.metrics['brierMinFDE'].avg:.4f}",
+                    })
+
+        pbar_v.close()
+
+        # Aggregate ALL metrics across ranks in a SINGLE collective call.
+        # CRITICAL: distributed_mean() calls dist.all_gather() which is a collective
+        # op — every rank MUST call it the same number of times, or DDP deadlocks.
+        # All per-level loss keys are bundled here (NOT inside `if is_main`).
+        extra_keys  = [k for k in val_meter.metrics if k != "loss"]
+        local_vals  = [
+            val_meter.metrics["loss"].avg,
+            ade_meter.metrics["minADE"].avg,
+            ade_meter.metrics["minFDE"].avg,
+            ade_meter.metrics["brierMinFDE"].avg,
+        ] + [val_meter.metrics[k].avg for k in extra_keys]
+        local_tensor  = torch.tensor(local_vals, dtype=torch.float64, device=device)
+        global_tensor = distributed_mean(local_tensor)          # collective on every rank
+        global_vals   = global_tensor.tolist()
+        val_loss_avg, min_ade_avg, min_fde_avg, brier_fde_avg = global_vals[:4]
+        extra_avgs    = dict(zip(extra_keys, global_vals[4:]))
+
+        if is_main:
+            logger.print(
+                f"[Validation] ep {epoch+1} | loss: {val_loss_avg:.4f} | "
+                f"minADE: {min_ade_avg:.4f} m | minFDE: {min_fde_avg:.4f} m | "
+                f"brierMinFDE: {brier_fde_avg:.4f} | "
+                f"time: {(time.time()-val_start)/60:.3f} mins"
+            )
+            logger.add_scalar("val/loss",        val_loss_avg,  it=epoch)
+            logger.add_scalar("val/minADE",      min_ade_avg,   it=epoch)
+            logger.add_scalar("val/minFDE",      min_fde_avg,   it=epoch)
+            logger.add_scalar("val/brierMinFDE", brier_fde_avg, it=epoch)
+            for k, v in extra_avgs.items():
+                logger.add_scalar(f"val/{k}", v, it=epoch)
+
+        # Save best checkpoint
+        if min_ade_avg < best_minADE - args.early_stop_min_delta:
+            improvement  = best_minADE - min_ade_avg
+            best_minADE  = min_ade_avg
+            best_val_loss = val_loss_avg
+            patience_ctr  = 0
+            if is_main:
+                logger.print(
+                    f"  >> minADE improved by {improvement:.4f} m → {best_minADE:.4f} m; "
+                    f"saving best checkpoint...")
+                safe_save(logger, model, optimizer, epoch, args.ckpt_dir, best_ckpt)
+        else:
+            patience_ctr += 1
+            patience_str = (f" | patience {patience_ctr}/{args.early_stop_patience}"
+                            if args.early_stop_patience > 0 else "")
+            if is_main:
+                logger.print(
+                    f"  -- No minADE improvement (best={best_minADE:.4f} m, "
+                    f"current={min_ade_avg:.4f} m){patience_str}")
+
+        if args.early_stop_patience > 0 and patience_ctr >= args.early_stop_patience:
+            if is_main:
+                should_stop.fill_(1)
+            dist.broadcast(should_stop, src=0)
+            if should_stop.item():
+                logger.print(f"Early stopping triggered at epoch {epoch+1}.")
+                break
+
+    logger.print(f"\nDone. Best minADE={best_minADE:.4f}m | best_val_loss={best_val_loss:.4f}")
+    dist.destroy_process_group()
+
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,784 @@
+
+################################################################################
+# SPLIT: train  --  5 samples  (dataset size: 20)
+################################################################################
+
+================================================================================
+SPLIT: train  |  Sample 1/5  |  Dataset index: 19
+================================================================================
+Agents in scene: 6/6  (focal + 5 neighbors: ids=[0, 13, 14, 17, 12, 11])
+Valid lanes    : 20/20
+
+--------------------------------------------------------------------------------
+1. TEXT PORTION  (semantic, no coordinate steps):
+--------------------------------------------------------------------------------
+Scenario 'ec34fcbf-4dbe-4779-8205-ab70fc752132' in miami. Task: High-Fidelity Motion Prediction.
+[SCENARIO IDENTIFICATION]
+Labels: Standard Driving
+
+[AFFORDANCE & INTENTION]
+Focal Agent Intention: Keep-Straight
+Map Affordance: Lane-Change-Restricted-Left (Solid Line)
+
+[FOCAL DYNAMICS]
+Speed: 7.5→5.9m/s (decelerating) | Heading: slight curve
+
+[SURROUNDING AGENTS CONTEXT]
+  Agent1 (Vehicle): Distance 4.6m | right-front | Speed -5.9m/s (slower than focal) | high conflict risk (TTC ~0.6s)
+  Agent2 (Vehicle): Distance 6.9m | far-left-front | Speed -5.9m/s (slower than focal) | low influence (parked)
+  Agent3 (Vehicle): Distance 31.2m | far-left-front | Speed -5.8m/s (slower than focal) | low influence (parked)
+  Agent4 (Vehicle): Distance 38.5m | right-front | Speed -5.9m/s (slower than focal) | low influence (parked)
+  Agent5 (Vehicle): Distance 43.5m | right-front | Speed -5.9m/s (slower than focal) | low influence (parked)
+
+[AGENT TRAJECTORIES]
+
+--------------------------------------------------------------------------------
+Text tokens: 328 / 384  (85.4% of max_text_len)
+
+--------------------------------------------------------------------------------
+2. AGENT NUMERICAL FEATURES  [shape: [6, 50, 13]  = (N=6, T_obs=50, feat=13)]
+   Features per timestep: x, y, vx, vy, cos_θ, sin_θ,  type_one_hot(7)
+--------------------------------------------------------------------------------
+  Slot 0: VEHICLE      | train   | 50/50 valid frames | speed=5.9–7.6 m/s | x:[-35.5,0.0] y:[-0.2,0.6]
+  Slot 1: VEHICLE      | context | 50/50 valid frames | speed=0.0–0.0 m/s | x:[-0.1,0.0] y:[-0.2,0.0]
+  Slot 2: VEHICLE      | context | 50/50 valid frames | speed=0.0–0.0 m/s | x:[-0.2,0.1] y:[-0.1,0.1]
+  Slot 3: STATIC       | context | 27/50 valid frames | speed=0.0–0.0 m/s | x:[-0.9,0.0] y:[0.0,0.3]
+  Slot 4: VEHICLE      | context | 50/50 valid frames | speed=0.0–0.0 m/s | x:[-0.3,0.0] y:[-0.0,0.0]
+  Slot 5: VEHICLE      | context | 50/50 valid frames | speed=0.0–0.0 m/s | x:[-0.2,0.0] y:[-0.1,0.0]
+
+--------------------------------------------------------------------------------
+3. LANE NUMERICAL FEATURES   [shape: [20, 10, 8]  = (L=20, pts=10, feat=8)]
+   Features per point: x, y, dx, dy, is_intersect, lane_type(3)
+--------------------------------------------------------------------------------
+  Valid lanes: 20/20 | Intersection lanes: 10 | Lane types: vehicle=200 bike=0 bus=0
+  Spatial range: x:[-10.6,10.6] y:[-1.8,1.9]
+
+--------------------------------------------------------------------------------
+4. inputs_embeds SEQUENCE LAYOUT  (all in LLM hidden space H):
+--------------------------------------------------------------------------------
+  inputs_embeds layout  (total = 360 tokens)
+  Region                         Start   Length     End
+  ----------------------------  ------  -------  ------
+  Text (semantic)                    0      328     327
+  Agent embeddings                 328        6     333
+  Lane embeddings                  334       20     353
+  [AGT] summary tokens             354        6     359
+  ─────────────────────────────────────────────────────
+  TOTAL                              0      360     359
+  AGT token positions: [354, 355, 356, 357, 358, 359]
+
+================================================================================
+5. __getitem__ TENSOR SHAPES  (shown once per split)
+================================================================================
+  text_input_ids              : shape=(384,)                     dtype=torch.int64
+  text_attention_mask         : shape=(384,)                     dtype=torch.int64
+  agent_features              : shape=(6, 50, 13)                dtype=torch.float32
+  agent_valid                 : shape=(6,)                       dtype=torch.bool
+  train_mask                  : shape=(6,)                       dtype=torch.bool
+  lane_features               : shape=(20, 10, 8)                dtype=torch.float32
+  lane_valid                  : shape=(20,)                      dtype=torch.bool
+  gt_abs_trajectories         : shape=(6, 60, 2)                 dtype=torch.float32
+  gt_anchor                   : shape=(6, 2)                     dtype=torch.float32
+  gt_masks                    : shape=(6, 60)                    dtype=torch.bool
+
+--------------------------------------------------------------------------------
+6. AGENT SLOT TABLE
+  Slot   traj_id  Type            valid   train   [AGT] pos
+  ----   -------  -----          ------  ------  ----------
+     0         0  VEHICLE          True    True         354
+     1        13  VEHICLE          True   False         355
+     2        14  VEHICLE          True   False         356
+     3        17  STATIC           True   False         357
+     4        12  VEHICLE          True   False         358
+     5        11  VEHICLE          True   False         359
+
+================================================================================
+SPLIT: train  |  Sample 2/5  |  Dataset index: 16
+================================================================================
+Agents in scene: 6/6  (focal + 5 neighbors: ids=[0, 6, 1, 2, 23, 4])
+Valid lanes    : 20/20
+
+--------------------------------------------------------------------------------
+1. TEXT PORTION  (semantic, no coordinate steps):
+--------------------------------------------------------------------------------
+Scenario 'a184c073-2b99-4a6b-81f4-5a10d1f95fdd' in washington-dc. Task: High-Fidelity Motion Prediction.
+[SCENARIO IDENTIFICATION]
+Labels: Approaching Intersection, Turning Scenario, Stop-and-Go Platooning
+
+[AFFORDANCE & INTENTION]
+Focal Agent Intention: Left-Turn
+Map Affordance: Intersection-Rules-Apply, Lane-Change-Allowed-Left
+
+[FOCAL DYNAMICS]
+Speed: 3.7→2.9m/s (decelerating) | Heading: turning left
+
+[SURROUNDING AGENTS CONTEXT]
+  Agent1 (Vehicle): Distance 17.4m | lead | Speed +1.7m/s (faster than focal, approaching if ahead) | high influence (direct path blockage)
+  Agent2 (Autonomous Vehicle): Distance 17.7m | left-front | Speed -1.7m/s (slower than focal) | high influence (cut-in hazard)
+  Agent3 (Vehicle): Distance 9.5m | far-left-front | Speed +0.5m/s (faster than focal, approaching if ahead) | low influence
+  Agent4 (Vehicle): Distance 14.1m | far-left-rear | Speed +0.8m/s (faster than focal, approaching if ahead) | low influence
+  Agent5 (Vehicle): Distance 14.6m | far-left-front | Speed +2.4m/s (faster than focal, approaching if ahead) | low influence
+
+[AGENT TRAJECTORIES]
+
+--------------------------------------------------------------------------------
+Text tokens: 355 / 384  (92.4% of max_text_len)
+
+--------------------------------------------------------------------------------
+2. AGENT NUMERICAL FEATURES  [shape: [6, 50, 13]  = (N=6, T_obs=50, feat=13)]
+   Features per timestep: x, y, vx, vy, cos_θ, sin_θ,  type_one_hot(7)
+--------------------------------------------------------------------------------
+  Slot 0: CYCLIST      | train   | 50/50 valid frames | speed=2.8–3.9 m/s | x:[-15.5,0.0] y:[-0.0,2.5]
+  Slot 1: VEHICLE      | train   | 50/50 valid frames | speed=4.6–6.9 m/s | x:[-29.4,0.0] y:[-0.0,0.1]
+  Slot 2: VEHICLE      | context | 50/50 valid frames | speed=1.2–4.6 m/s | x:[-14.6,0.0] y:[-0.1,0.0]
+  Slot 3: VEHICLE      | train   | 50/50 valid frames | speed=3.4–6.2 m/s | x:[-21.5,0.0] y:[0.0,0.6]
+  Slot 4: VEHICLE      | context | 29/50 valid frames | speed=3.5–4.9 m/s | x:[-9.4,0.0] y:[-0.1,2.1]
+  Slot 5: VEHICLE      | train   | 50/50 valid frames | speed=5.4–7.1 m/s | x:[-31.4,0.0] y:[-0.0,0.2]
+
+--------------------------------------------------------------------------------
+3. LANE NUMERICAL FEATURES   [shape: [20, 10, 8]  = (L=20, pts=10, feat=8)]
+   Features per point: x, y, dx, dy, is_intersect, lane_type(3)
+--------------------------------------------------------------------------------
+  Valid lanes: 20/20 | Intersection lanes: 5 | Lane types: vehicle=200 bike=0 bus=0
+  Spatial range: x:[-12.4,12.5] y:[-2.1,2.0]
+
+--------------------------------------------------------------------------------
+4. inputs_embeds SEQUENCE LAYOUT  (all in LLM hidden space H):
+--------------------------------------------------------------------------------
+  inputs_embeds layout  (total = 387 tokens)
+  Region                         Start   Length     End
+  ----------------------------  ------  -------  ------
+  Text (semantic)                    0      355     354
+  Agent embeddings                 355        6     360
+  Lane embeddings                  361       20     380
+  [AGT] summary tokens             381        6     386
+  ─────────────────────────────────────────────────────
+  TOTAL                              0      387     386
+  AGT token positions: [381, 382, 383, 384, 385, 386]
+
+--------------------------------------------------------------------------------
+6. AGENT SLOT TABLE
+  Slot   traj_id  Type            valid   train   [AGT] pos
+  ----   -------  -----          ------  ------  ----------
+     0         0  CYCLIST          True    True         381
+     1         6  VEHICLE          True    True         382
+     2         1  VEHICLE          True   False         383
+     3         2  VEHICLE          True    True         384
+     4        23  VEHICLE          True   False         385
+     5         4  VEHICLE          True    True         386
+
+================================================================================
+SPLIT: train  |  Sample 3/5  |  Dataset index: 14
+================================================================================
+Agents in scene: 6/6  (focal + 5 neighbors: ids=[0, 2, 3, 1, 13, 7])
+Valid lanes    : 20/20
+
+--------------------------------------------------------------------------------
+1. TEXT PORTION  (semantic, no coordinate steps):
+--------------------------------------------------------------------------------
+Scenario '9960e150-1ccf-4c6c-9234-08d559c7e203' in palo-alto. Task: High-Fidelity Motion Prediction.
+[SCENARIO IDENTIFICATION]
+Labels: Turning Scenario
+
+[AFFORDANCE & INTENTION]
+Focal Agent Intention: Left-Turn
+Map Affordance: Lane-Change-Restricted-Left (Solid Line), Lane-Change-Restricted-Right (Solid Line)
+
+[FOCAL DYNAMICS]
+Speed: 10.4→5.2m/s (decelerating) | Heading: turning left
+
+[SURROUNDING AGENTS CONTEXT]
+  Agent1 (Vehicle): Distance 6.6m | right-front | Speed -5.2m/s (slower than focal) | high conflict risk (TTC ~1.1s)
+  Agent2 (Vehicle): Distance 11.8m | right-front | Speed -5.2m/s (slower than focal) | high conflict risk (TTC ~2.2s)
+  Agent3 (Autonomous Vehicle): Distance 9.1m | lead | Speed -1.3m/s (slower than focal) | high influence (direct path blockage)
+  Agent4 (Vehicle): Distance 10.7m | far-left-front | Speed -5.2m/s (slower than focal) | low influence
+  Agent5 (Vehicle): Distance 16.1m | far-left-front | Speed -5.2m/s (slower than focal) | low influence
+
+[AGENT TRAJECTORIES]
+
+--------------------------------------------------------------------------------
+Text tokens: 351 / 384  (91.4% of max_text_len)
+
+--------------------------------------------------------------------------------
+2. AGENT NUMERICAL FEATURES  [shape: [6, 50, 13]  = (N=6, T_obs=50, feat=13)]
+   Features per timestep: x, y, vx, vy, cos_θ, sin_θ,  type_one_hot(7)
+--------------------------------------------------------------------------------
+  Slot 0: VEHICLE      | train   | 50/50 valid frames | speed=5.2–10.4 m/s | x:[-36.7,0.0] y:[-0.1,11.3]
+  Slot 1: VEHICLE      | train   | 50/50 valid frames | speed=0.0–0.0 m/s | x:[0.0,0.2] y:[-0.0,0.0]
+  Slot 2: VEHICLE      | train   | 50/50 valid frames | speed=0.0–0.0 m/s | x:[-0.1,0.0] y:[-0.0,0.0]
+  Slot 3: VEHICLE      | context | 50/50 valid frames | speed=0.0–10.6 m/s | x:[-32.3,0.0] y:[0.0,11.7]
+  Slot 4: VEHICLE      | context | 36/50 valid frames | speed=0.0–1.4 m/s | x:[-0.3,0.5] y:[-0.1,0.5]
+  Slot 5: VEHICLE      | train   | 50/50 valid frames | speed=0.0–0.7 m/s | x:[-1.5,0.1] y:[-0.0,0.4]
+
+--------------------------------------------------------------------------------
+3. LANE NUMERICAL FEATURES   [shape: [20, 10, 8]  = (L=20, pts=10, feat=8)]
+   Features per point: x, y, dx, dy, is_intersect, lane_type(3)
+--------------------------------------------------------------------------------
+  Valid lanes: 20/20 | Intersection lanes: 12 | Lane types: vehicle=130 bike=70 bus=0
+  Spatial range: x:[-12.4,12.3] y:[-1.5,1.7]
+
+--------------------------------------------------------------------------------
+4. inputs_embeds SEQUENCE LAYOUT  (all in LLM hidden space H):
+--------------------------------------------------------------------------------
+  inputs_embeds layout  (total = 383 tokens)
+  Region                         Start   Length     End
+  ----------------------------  ------  -------  ------
+  Text (semantic)                    0      351     350
+  Agent embeddings                 351        6     356
+  Lane embeddings                  357       20     376
+  [AGT] summary tokens             377        6     382
+  ─────────────────────────────────────────────────────
+  TOTAL                              0      383     382
+  AGT token positions: [377, 378, 379, 380, 381, 382]
+
+--------------------------------------------------------------------------------
+6. AGENT SLOT TABLE
+  Slot   traj_id  Type            valid   train   [AGT] pos
+  ----   -------  -----          ------  ------  ----------
+     0         0  VEHICLE          True    True         377
+     1         2  VEHICLE          True    True         378
+     2         3  VEHICLE          True    True         379
+     3         1  VEHICLE          True   False         380
+     4        13  VEHICLE          True   False         381
+     5         7  VEHICLE          True    True         382
+
+================================================================================
+SPLIT: train  |  Sample 4/5  |  Dataset index: 5
+================================================================================
+Agents in scene: 6/6  (focal + 5 neighbors: ids=[0, 2, 4, 5, 6, 1])
+Valid lanes    : 20/20
+
+--------------------------------------------------------------------------------
+1. TEXT PORTION  (semantic, no coordinate steps):
+--------------------------------------------------------------------------------
+Scenario '5d70a120-46dd-41f5-8eb5-a6046479f29d' in pittsburgh. Task: High-Fidelity Motion Prediction.
+[SCENARIO IDENTIFICATION]
+Labels: Turning Scenario, Stop-and-Go Platooning
+
+[AFFORDANCE & INTENTION]
+Focal Agent Intention: Right-Turn
+Map Affordance: Lane-Change-Restricted-Left (Solid Line), Lane-Change-Restricted-Right (Solid Line)
+
+[FOCAL DYNAMICS]
+Speed: 7.2→2.3m/s (decelerating) | Heading: turning right
+
+[SURROUNDING AGENTS CONTEXT]
+  Agent1 (Vehicle): Distance 9.1m | lead | Speed -2.3m/s (slower than focal) | high conflict risk (TTC ~4.0s)
+  Agent2 (Vehicle): Distance 21.0m | lead | Speed -2.3m/s (slower than focal) | high influence (direct path blockage)
+  Agent3 (Vehicle): Distance 8.3m | left-front | Speed -1.8m/s (slower than focal) | moderate influence (close proximity)
+  Agent4 (Vehicle): Distance 11.6m | far-right-rear | Speed -1.3m/s (slower than focal) | low influence
+  Agent5 (Autonomous Vehicle): Distance 13.8m | far-left-front | Speed -2.3m/s (slower than focal) | low influence
+
+[AGENT TRAJECTORIES]
+
+--------------------------------------------------------------------------------
+Text tokens: 348 / 384  (90.6% of max_text_len)
+
+--------------------------------------------------------------------------------
+2. AGENT NUMERICAL FEATURES  [shape: [6, 50, 13]  = (N=6, T_obs=50, feat=13)]
+   Features per timestep: x, y, vx, vy, cos_θ, sin_θ,  type_one_hot(7)
+--------------------------------------------------------------------------------
+  Slot 0: VEHICLE      | train   | 50/50 valid frames | speed=2.3–7.2 m/s | x:[-20.7,0.0] y:[-0.3,1.2]
+  Slot 1: VEHICLE      | train   | 50/50 valid frames | speed=0.0–0.1 m/s | x:[-0.0,0.5] y:[-0.0,0.0]
+  Slot 2: BUS          | train   | 50/50 valid frames | speed=0.0–0.0 m/s | x:[-0.2,0.1] y:[-0.0,0.0]
+  Slot 3: VEHICLE      | train   | 50/50 valid frames | speed=0.0–0.7 m/s | x:[-0.7,0.0] y:[-0.1,0.0]
+  Slot 4: VEHICLE      | context | 49/50 valid frames | speed=0.0–1.0 m/s | x:[-0.3,0.3] y:[-0.7,0.0]
+  Slot 5: VEHICLE      | context | 50/50 valid frames | speed=0.0–3.5 m/s | x:[-5.6,0.0] y:[-0.4,0.0]
+
+--------------------------------------------------------------------------------
+3. LANE NUMERICAL FEATURES   [shape: [20, 10, 8]  = (L=20, pts=10, feat=8)]
+   Features per point: x, y, dx, dy, is_intersect, lane_type(3)
+--------------------------------------------------------------------------------
+  Valid lanes: 20/20 | Intersection lanes: 0 | Lane types: vehicle=200 bike=0 bus=0
+  Spatial range: x:[-13.2,13.2] y:[-1.1,1.2]
+
+--------------------------------------------------------------------------------
+4. inputs_embeds SEQUENCE LAYOUT  (all in LLM hidden space H):
+--------------------------------------------------------------------------------
+  inputs_embeds layout  (total = 380 tokens)
+  Region                         Start   Length     End
+  ----------------------------  ------  -------  ------
+  Text (semantic)                    0      348     347
+  Agent embeddings                 348        6     353
+  Lane embeddings                  354       20     373
+  [AGT] summary tokens             374        6     379
+  ─────────────────────────────────────────────────────
+  TOTAL                              0      380     379
+  AGT token positions: [374, 375, 376, 377, 378, 379]
+
+--------------------------------------------------------------------------------
+6. AGENT SLOT TABLE
+  Slot   traj_id  Type            valid   train   [AGT] pos
+  ----   -------  -----          ------  ------  ----------
+     0         0  VEHICLE          True    True         374
+     1         2  VEHICLE          True    True         375
+     2         4  BUS              True    True         376
+     3         5  VEHICLE          True    True         377
+     4         6  VEHICLE          True   False         378
+     5         1  VEHICLE          True   False         379
+
+================================================================================
+SPLIT: train  |  Sample 5/5  |  Dataset index: 1
+================================================================================
+Agents in scene: 6/6  (focal + 5 neighbors: ids=[0, 14, 37, 24, 28, 40])
+Valid lanes    : 20/20
+
+--------------------------------------------------------------------------------
+1. TEXT PORTION  (semantic, no coordinate steps):
+--------------------------------------------------------------------------------
+Scenario '2560f2d5-b8b1-407d-8f97-1dac7fd733ae' in washington-dc. Task: High-Fidelity Motion Prediction.
+[SCENARIO IDENTIFICATION]
+Labels: Straight Roadway, Stop-and-Go Platooning
+
+[AFFORDANCE & INTENTION]
+Focal Agent Intention: Keep-Straight
+Map Affordance: Lane-Change-Allowed-Right
+
+[FOCAL DYNAMICS]
+Speed: 6.6→4.5m/s (decelerating) | Heading: straight ahead
+
+[SURROUNDING AGENTS CONTEXT]
+  Agent1 (Vehicle): Distance 12.6m | lead | Speed -0.8m/s (slower than focal) | high influence (direct path blockage)
+  Agent2 (Vehicle): Distance 3.0m | right-rear | Speed +7.3m/s (faster than focal, approaching if ahead) | low influence
+  Agent3 (Vehicle): Distance 14.7m | far-left-rear | Speed +10.8m/s (faster than focal, approaching if ahead) | low influence
+  Agent4 (Vehicle): Distance 19.8m | far-left-front | Speed +9.9m/s (faster than focal, approaching if ahead) | low influence
+  Agent5 (Vehicle): Distance 19.8m | far-right-front | Speed +12.0m/s (faster than focal, approaching if ahead) | low influence
+
+[AGENT TRAJECTORIES]
+
+--------------------------------------------------------------------------------
+Text tokens: 340 / 384  (88.5% of max_text_len)
+
+--------------------------------------------------------------------------------
+2. AGENT NUMERICAL FEATURES  [shape: [6, 50, 13]  = (N=6, T_obs=50, feat=13)]
+   Features per timestep: x, y, vx, vy, cos_θ, sin_θ,  type_one_hot(7)
+--------------------------------------------------------------------------------
+  Slot 0: VEHICLE      | train   | 50/50 valid frames | speed=4.5–9.2 m/s | x:[-35.2,0.0] y:[-0.2,0.2]
+  Slot 1: VEHICLE      | context | 50/50 valid frames | speed=3.7–10.3 m/s | x:[-30.8,0.0] y:[-0.0,0.3]
+  Slot 2: VEHICLE      | context | 17/50 valid frames | speed=10.4–12.4 m/s | x:[-16.1,0.0] y:[-0.6,0.0]
+  Slot 3: VEHICLE      | context | 49/50 valid frames | speed=12.3–15.3 m/s | x:[-69.0,0.0] y:[-0.1,0.4]
+  Slot 4: VEHICLE      | context | 49/50 valid frames | speed=11.9–14.5 m/s | x:[-63.5,0.0] y:[-0.0,0.1]
+  Slot 5: VEHICLE      | context | 11/50 valid frames | speed=5.6–16.9 m/s | x:[-14.5,0.0] y:[-0.3,0.0]
+
+--------------------------------------------------------------------------------
+3. LANE NUMERICAL FEATURES   [shape: [20, 10, 8]  = (L=20, pts=10, feat=8)]
+   Features per point: x, y, dx, dy, is_intersect, lane_type(3)
+--------------------------------------------------------------------------------
+  Valid lanes: 20/20 | Intersection lanes: 0 | Lane types: vehicle=200 bike=0 bus=0
+  Spatial range: x:[-12.6,12.6] y:[-0.0,0.0]
+
+--------------------------------------------------------------------------------
+4. inputs_embeds SEQUENCE LAYOUT  (all in LLM hidden space H):
+--------------------------------------------------------------------------------
+  inputs_embeds layout  (total = 372 tokens)
+  Region                         Start   Length     End
+  ----------------------------  ------  -------  ------
+  Text (semantic)                    0      340     339
+  Agent embeddings                 340        6     345
+  Lane embeddings                  346       20     365
+  [AGT] summary tokens             366        6     371
+  ─────────────────────────────────────────────────────
+  TOTAL                              0      372     371
+  AGT token positions: [366, 367, 368, 369, 370, 371]
+
+--------------------------------------------------------------------------------
+6. AGENT SLOT TABLE
+  Slot   traj_id  Type            valid   train   [AGT] pos
+  ----   -------  -----          ------  ------  ----------
+     0         0  VEHICLE          True    True         366
+     1        14  VEHICLE          True   False         367
+     2        37  VEHICLE          True   False         368
+     3        24  VEHICLE          True   False         369
+     4        28  VEHICLE          True   False         370
+     5        40  VEHICLE          True   False         371
+
+
+################################################################################
+# SPLIT: val  --  5 samples  (dataset size: 20)
+################################################################################
+
+================================================================================
+SPLIT: val  |  Sample 1/5  |  Dataset index: 6
+================================================================================
+Agents in scene: 5/6  (focal + 4 neighbors: ids=[0, 14, 3, 13, 5])
+Valid lanes    : 20/20
+
+--------------------------------------------------------------------------------
+1. TEXT PORTION  (semantic, no coordinate steps):
+--------------------------------------------------------------------------------
+Scenario '24bca9aa-29fe-43a5-acb0-14993227c5e8' in pittsburgh. Task: High-Fidelity Motion Prediction.
+[SCENARIO IDENTIFICATION]
+Labels: Straight Roadway
+
+[AFFORDANCE & INTENTION]
+Focal Agent Intention: Keep-Straight
+Map Affordance: Lane-Change-Allowed-Left
+
+[FOCAL DYNAMICS]
+Speed: 15.2→15.6m/s (constant speed) | Heading: straight ahead
+
+[SURROUNDING AGENTS CONTEXT]
+  Agent1 (Vehicle): Distance 13.3m | right-front | Speed -15.6m/s (slower than focal) | high conflict risk (TTC ~0.8s)
+  Agent2 (Vehicle): Distance 20.6m | left-rear | Speed -4.0m/s (slower than focal) | low influence
+  Agent3 (Vehicle): Distance 24.9m | far-left-front | Speed -15.6m/s (slower than focal) | low influence (parked)
+  Agent4 (Vehicle): Distance 33.2m | far-left-rear | Speed -15.6m/s (slower than focal) | low influence (parked)
+
+[AGENT TRAJECTORIES]
+
+--------------------------------------------------------------------------------
+Text tokens: 295 / 384  (76.8% of max_text_len)
+
+--------------------------------------------------------------------------------
+2. AGENT NUMERICAL FEATURES  [shape: [6, 50, 13]  = (N=6, T_obs=50, feat=13)]
+   Features per timestep: x, y, vx, vy, cos_θ, sin_θ,  type_one_hot(7)
+--------------------------------------------------------------------------------
+  Slot 0: VEHICLE      | train   | 50/50 valid frames | speed=15.2–16.0 m/s | x:[-75.2,0.0] y:[-0.3,0.1]
+  Slot 1: VEHICLE      | context | 12/50 valid frames | speed=0.0–0.1 m/s | x:[-1.4,0.1] y:[-0.0,0.2]
+  Slot 2: VEHICLE      | context | 50/50 valid frames | speed=11.6–12.3 m/s | x:[-58.1,0.0] y:[-0.4,0.2]
+  Slot 3: VEHICLE      | context | 12/50 valid frames | speed=0.0–0.4 m/s | x:[-0.9,0.4] y:[-0.1,0.1]
+  Slot 4: VEHICLE      | context | 50/50 valid frames | speed=0.0–0.0 m/s | x:[-0.0,0.0] y:[-0.1,0.0]
+  Slot 5: (padding)
+
+--------------------------------------------------------------------------------
+3. LANE NUMERICAL FEATURES   [shape: [20, 10, 8]  = (L=20, pts=10, feat=8)]
+   Features per point: x, y, dx, dy, is_intersect, lane_type(3)
+--------------------------------------------------------------------------------
+  Valid lanes: 20/20 | Intersection lanes: 7 | Lane types: vehicle=200 bike=0 bus=0
+  Spatial range: x:[-10.2,10.2] y:[-1.6,1.7]
+
+--------------------------------------------------------------------------------
+4. inputs_embeds SEQUENCE LAYOUT  (all in LLM hidden space H):
+--------------------------------------------------------------------------------
+  inputs_embeds layout  (total = 327 tokens)
+  Region                         Start   Length     End
+  ----------------------------  ------  -------  ------
+  Text (semantic)                    0      295     294
+  Agent embeddings                 295        6     300
+  Lane embeddings                  301       20     320
+  [AGT] summary tokens             321        6     326
+  ─────────────────────────────────────────────────────
+  TOTAL                              0      327     326
+  AGT token positions: [321, 322, 323, 324, 325, 326]
+
+================================================================================
+5. __getitem__ TENSOR SHAPES  (shown once per split)
+================================================================================
+  text_input_ids              : shape=(384,)                     dtype=torch.int64
+  text_attention_mask         : shape=(384,)                     dtype=torch.int64
+  agent_features              : shape=(6, 50, 13)                dtype=torch.float32
+  agent_valid                 : shape=(6,)                       dtype=torch.bool
+  train_mask                  : shape=(6,)                       dtype=torch.bool
+  lane_features               : shape=(20, 10, 8)                dtype=torch.float32
+  lane_valid                  : shape=(20,)                      dtype=torch.bool
+  gt_abs_trajectories         : shape=(6, 60, 2)                 dtype=torch.float32
+  gt_anchor                   : shape=(6, 2)                     dtype=torch.float32
+  gt_masks                    : shape=(6, 60)                    dtype=torch.bool
+
+--------------------------------------------------------------------------------
+6. AGENT SLOT TABLE
+  Slot   traj_id  Type            valid   train   [AGT] pos
+  ----   -------  -----          ------  ------  ----------
+     0         0  VEHICLE          True    True         321
+     1        14  VEHICLE          True   False         322
+     2         3  VEHICLE          True   False         323
+     3        13  VEHICLE          True   False         324
+     4         5  VEHICLE          True   False         325
+     5        -1  (padding)       False   False         326
+
+================================================================================
+SPLIT: val  |  Sample 2/5  |  Dataset index: 14
+================================================================================
+Agents in scene: 6/6  (focal + 5 neighbors: ids=[0, 5, 3, 11, 1, 8])
+Valid lanes    : 20/20
+
+--------------------------------------------------------------------------------
+1. TEXT PORTION  (semantic, no coordinate steps):
+--------------------------------------------------------------------------------
+Scenario '98090308-2097-4ba8-bf2a-45f2ba1011ac' in miami. Task: High-Fidelity Motion Prediction.
+[SCENARIO IDENTIFICATION]
+Labels: Approaching Intersection, Turning Scenario
+
+[AFFORDANCE & INTENTION]
+Focal Agent Intention: U-Turn
+Map Affordance: Intersection-Rules-Apply
+
+[FOCAL DYNAMICS]
+Speed: 2.6→5.0m/s (accelerating) | Heading: turning left
+
+[SURROUNDING AGENTS CONTEXT]
+  Agent1 (Vehicle): Distance 15.5m | right-front | Speed -5.0m/s (slower than focal) | low influence (parked)
+  Agent2 (Vehicle): Distance 24.4m | far-right-rear | Speed -5.0m/s (slower than focal) | low influence (parked)
+  Agent3 (Vehicle): Distance 25.6m | far-right-rear | Speed -5.0m/s (slower than focal) | low influence (parked)
+  Agent4 (Autonomous Vehicle): Distance 26.7m | far-left-rear | Speed -5.0m/s (slower than focal) | low influence (parked)
+  Agent5 (Vehicle): Distance 27.1m | far-right-front | Speed -5.0m/s (slower than focal) | low influence (parked)
+
+[AGENT TRAJECTORIES]
+
+--------------------------------------------------------------------------------
+Text tokens: 330 / 384  (85.9% of max_text_len)
+
+--------------------------------------------------------------------------------
+2. AGENT NUMERICAL FEATURES  [shape: [6, 50, 13]  = (N=6, T_obs=50, feat=13)]
+   Features per timestep: x, y, vx, vy, cos_θ, sin_θ,  type_one_hot(7)
+--------------------------------------------------------------------------------
+  Slot 0: VEHICLE      | train   | 50/50 valid frames | speed=2.5–5.0 m/s | x:[-9.2,0.0] y:[-0.1,7.7]
+  Slot 1: VEHICLE      | context | 50/50 valid frames | speed=0.0–0.0 m/s | x:[-0.0,0.1] y:[-0.0,0.0]
+  Slot 2: VEHICLE      | context | 50/50 valid frames | speed=0.0–0.0 m/s | x:[-1.5,0.0] y:[-0.3,0.0]
+  Slot 3: STATIC       | context | 40/50 valid frames | speed=0.0–0.0 m/s | x:[-1.5,0.9] y:[-0.5,0.3]
+  Slot 4: VEHICLE      | context | 50/50 valid frames | speed=0.0–0.0 m/s | x:[-0.0,0.0] y:[-0.0,0.0]
+  Slot 5: VEHICLE      | context | 50/50 valid frames | speed=0.0–0.0 m/s | x:[-0.0,0.1] y:[-0.1,0.0]
+
+--------------------------------------------------------------------------------
+3. LANE NUMERICAL FEATURES   [shape: [20, 10, 8]  = (L=20, pts=10, feat=8)]
+   Features per point: x, y, dx, dy, is_intersect, lane_type(3)
+--------------------------------------------------------------------------------
+  Valid lanes: 20/20 | Intersection lanes: 12 | Lane types: vehicle=200 bike=0 bus=0
+  Spatial range: x:[-11.6,11.6] y:[-1.9,2.1]
+
+--------------------------------------------------------------------------------
+4. inputs_embeds SEQUENCE LAYOUT  (all in LLM hidden space H):
+--------------------------------------------------------------------------------
+  inputs_embeds layout  (total = 362 tokens)
+  Region                         Start   Length     End
+  ----------------------------  ------  -------  ------
+  Text (semantic)                    0      330     329
+  Agent embeddings                 330        6     335
+  Lane embeddings                  336       20     355
+  [AGT] summary tokens             356        6     361
+  ─────────────────────────────────────────────────────
+  TOTAL                              0      362     361
+  AGT token positions: [356, 357, 358, 359, 360, 361]
+
+--------------------------------------------------------------------------------
+6. AGENT SLOT TABLE
+  Slot   traj_id  Type            valid   train   [AGT] pos
+  ----   -------  -----          ------  ------  ----------
+     0         0  VEHICLE          True    True         356
+     1         5  VEHICLE          True   False         357
+     2         3  VEHICLE          True   False         358
+     3        11  STATIC           True   False         359
+     4         1  VEHICLE          True   False         360
+     5         8  VEHICLE          True   False         361
+
+================================================================================
+SPLIT: val  |  Sample 3/5  |  Dataset index: 11
+================================================================================
+Agents in scene: 6/6  (focal + 5 neighbors: ids=[0, 1, 16, 7, 2, 3])
+Valid lanes    : 20/20
+
+--------------------------------------------------------------------------------
+1. TEXT PORTION  (semantic, no coordinate steps):
+--------------------------------------------------------------------------------
+Scenario '5af7129e-e175-4016-bbeb-dff1e9c5fb34' in austin. Task: High-Fidelity Motion Prediction.
+[SCENARIO IDENTIFICATION]
+Labels: Approaching Intersection
+
+[AFFORDANCE & INTENTION]
+Focal Agent Intention: Keep-Straight
+Map Affordance: Intersection-Rules-Apply, Lane-Change-Restricted-Left (Solid Line)
+
+[FOCAL DYNAMICS]
+Speed: 9.7→9.3m/s (constant speed) | Heading: straight ahead
+
+[SURROUNDING AGENTS CONTEXT]
+  Agent1 (Autonomous Vehicle): Distance 12.4m | far-left-front | Speed -9.2m/s (slower than focal) | low influence
+  Agent2 (Vehicle): Distance 19.3m | far-right-rear | Speed -9.3m/s (slower than focal) | low influence (parked)
+  Agent3 (Vehicle): Distance 22.9m | far-right-rear | Speed -9.3m/s (slower than focal) | low influence (parked)
+  Agent4 (Vehicle): Distance 26.1m | far-left-front | Speed -9.3m/s (slower than focal) | low influence (parked)
+  Agent5 (Vehicle): Distance 28.2m | far-right-rear | Speed -9.3m/s (slower than focal) | low influence (parked)
+
+[AGENT TRAJECTORIES]
+
+--------------------------------------------------------------------------------
+Text tokens: 333 / 384  (86.7% of max_text_len)
+
+--------------------------------------------------------------------------------
+2. AGENT NUMERICAL FEATURES  [shape: [6, 50, 13]  = (N=6, T_obs=50, feat=13)]
+   Features per timestep: x, y, vx, vy, cos_θ, sin_θ,  type_one_hot(7)
+--------------------------------------------------------------------------------
+  Slot 0: VEHICLE      | train   | 50/50 valid frames | speed=8.6–10.2 m/s | x:[-44.7,0.0] y:[-0.3,0.0]
+  Slot 1: VEHICLE      | context | 50/50 valid frames | speed=0.0–1.1 m/s | x:[-1.9,0.0] y:[-0.1,0.0]
+  Slot 2: STATIC       | context | 7/50 valid frames | speed=0.0–0.0 m/s | x:[0.0,0.1] y:[0.0,0.0]
+  Slot 3: VEHICLE      | context | 50/50 valid frames | speed=0.0–0.0 m/s | x:[-0.1,0.0] y:[-0.0,0.0]
+  Slot 4: VEHICLE      | train   | 50/50 valid frames | speed=0.0–0.0 m/s | x:[-0.1,0.0] y:[-0.0,0.1]
+  Slot 5: VEHICLE      | context | 50/50 valid frames | speed=0.0–0.0 m/s | x:[-0.0,0.0] y:[0.0,0.1]
+
+--------------------------------------------------------------------------------
+3. LANE NUMERICAL FEATURES   [shape: [20, 10, 8]  = (L=20, pts=10, feat=8)]
+   Features per point: x, y, dx, dy, is_intersect, lane_type(3)
+--------------------------------------------------------------------------------
+  Valid lanes: 20/20 | Intersection lanes: 20 | Lane types: vehicle=160 bike=40 bus=0
+  Spatial range: x:[-11.4,12.2] y:[-2.5,2.5]
+
+--------------------------------------------------------------------------------
+4. inputs_embeds SEQUENCE LAYOUT  (all in LLM hidden space H):
+--------------------------------------------------------------------------------
+  inputs_embeds layout  (total = 365 tokens)
+  Region                         Start   Length     End
+  ----------------------------  ------  -------  ------
+  Text (semantic)                    0      333     332
+  Agent embeddings                 333        6     338
+  Lane embeddings                  339       20     358
+  [AGT] summary tokens             359        6     364
+  ─────────────────────────────────────────────────────
+  TOTAL                              0      365     364
+  AGT token positions: [359, 360, 361, 362, 363, 364]
+
+--------------------------------------------------------------------------------
+6. AGENT SLOT TABLE
+  Slot   traj_id  Type            valid   train   [AGT] pos
+  ----   -------  -----          ------  ------  ----------
+     0         0  VEHICLE          True    True         359
+     1         1  VEHICLE          True   False         360
+     2        16  STATIC           True   False         361
+     3         7  VEHICLE          True   False         362
+     4         2  VEHICLE          True    True         363
+     5         3  VEHICLE          True   False         364
+
+================================================================================
+SPLIT: val  |  Sample 4/5  |  Dataset index: 17
+================================================================================
+Agents in scene: 4/6  (focal + 3 neighbors: ids=[0, 5, 3, 2])
+Valid lanes    : 20/20
+
+--------------------------------------------------------------------------------
+1. TEXT PORTION  (semantic, no coordinate steps):
+--------------------------------------------------------------------------------
+Scenario 'c79f1fd5-7ed4-4a3c-bff5-6a6e95028205' in dearborn. Task: High-Fidelity Motion Prediction.
+[SCENARIO IDENTIFICATION]
+Labels: Standard Driving
+
+[AFFORDANCE & INTENTION]
+Focal Agent Intention: Keep-Straight
+Map Affordance: Lane-Change-Allowed-Right
+
+[FOCAL DYNAMICS]
+Speed: 0.1→5.5m/s (accelerating) | Heading: slight curve
+
+[SURROUNDING AGENTS CONTEXT]
+  Agent1 (Vehicle): Distance 15.5m | left-front | Speed -5.5m/s (slower than focal) | high conflict risk (TTC ~2.8s)
+  Agent2 (Vehicle): Distance 24.7m | lead | Speed +0.9m/s (faster than focal, approaching if ahead) | high influence (direct path blockage)
+  Agent3 (Vehicle): Distance 26.6m | right-front | Speed +2.4m/s (faster than focal, approaching if ahead) | low influence
+
+[AGENT TRAJECTORIES]
+
+--------------------------------------------------------------------------------
+Text tokens: 258 / 384  (67.2% of max_text_len)
+
+--------------------------------------------------------------------------------
+2. AGENT NUMERICAL FEATURES  [shape: [6, 50, 13]  = (N=6, T_obs=50, feat=13)]
+   Features per timestep: x, y, vx, vy, cos_θ, sin_θ,  type_one_hot(7)
+--------------------------------------------------------------------------------
+  Slot 0: VEHICLE      | train   | 50/50 valid frames | speed=0.0–5.5 m/s | x:[-10.7,0.0] y:[-0.0,0.2]
+  Slot 1: STATIC       | context | 28/50 valid frames | speed=0.0–0.0 m/s | x:[-0.0,0.0] y:[-0.0,0.1]
+  Slot 2: VEHICLE      | context | 37/50 valid frames | speed=1.7–7.0 m/s | x:[-21.6,0.0] y:[-0.6,0.0]
+  Slot 3: VEHICLE      | context | 50/50 valid frames | speed=7.7–8.4 m/s | x:[-38.5,0.0] y:[-0.1,0.0]
+  Slot 4: (padding)
+  Slot 5: (padding)
+
+--------------------------------------------------------------------------------
+3. LANE NUMERICAL FEATURES   [shape: [20, 10, 8]  = (L=20, pts=10, feat=8)]
+   Features per point: x, y, dx, dy, is_intersect, lane_type(3)
+--------------------------------------------------------------------------------
+  Valid lanes: 20/20 | Intersection lanes: 0 | Lane types: vehicle=200 bike=0 bus=0
+  Spatial range: x:[-10.7,10.7] y:[-0.4,0.3]
+
+--------------------------------------------------------------------------------
+4. inputs_embeds SEQUENCE LAYOUT  (all in LLM hidden space H):
+--------------------------------------------------------------------------------
+  inputs_embeds layout  (total = 290 tokens)
+  Region                         Start   Length     End
+  ----------------------------  ------  -------  ------
+  Text (semantic)                    0      258     257
+  Agent embeddings                 258        6     263
+  Lane embeddings                  264       20     283
+  [AGT] summary tokens             284        6     289
+  ─────────────────────────────────────────────────────
+  TOTAL                              0      290     289
+  AGT token positions: [284, 285, 286, 287, 288, 289]
+
+--------------------------------------------------------------------------------
+6. AGENT SLOT TABLE
+  Slot   traj_id  Type            valid   train   [AGT] pos
+  ----   -------  -----          ------  ------  ----------
+     0         0  VEHICLE          True    True         284
+     1         5  STATIC           True   False         285
+     2         3  VEHICLE          True   False         286
+     3         2  VEHICLE          True   False         287
+     4        -1  (padding)       False   False         288
+     5        -1  (padding)       False   False         289
+
+================================================================================
+SPLIT: val  |  Sample 5/5  |  Dataset index: 8
+================================================================================
+Agents in scene: 3/6  (focal + 2 neighbors: ids=[0, 6, 3])
+Valid lanes    : 20/20
+
+--------------------------------------------------------------------------------
+1. TEXT PORTION  (semantic, no coordinate steps):
+--------------------------------------------------------------------------------
+Scenario '3904f100-4ffb-45ba-a52a-08aa7aed9b01' in pittsburgh. Task: High-Fidelity Motion Prediction.
+[SCENARIO IDENTIFICATION]
+Labels: Straight Roadway
+
+[AFFORDANCE & INTENTION]
+Focal Agent Intention: Keep-Straight
+Map Affordance: Lane-Change-Restricted-Left (Solid Line), Lane-Change-Allowed-Right
+
+[FOCAL DYNAMICS]
+Speed: 15.2→12.0m/s (decelerating) | Heading: straight ahead
+
+[SURROUNDING AGENTS CONTEXT]
+  Agent1 (Vehicle): Distance 38.8m | left-front | Speed -12.0m/s (slower than focal) | high conflict risk (TTC ~3.2s)
+  Agent2 (Vehicle): Distance 48.4m | left-front | Speed -12.0m/s (slower than focal) | low influence (parked)
+
+[AGENT TRAJECTORIES]
+
+--------------------------------------------------------------------------------
+Text tokens: 231 / 384  (60.2% of max_text_len)
+
+--------------------------------------------------------------------------------
+2. AGENT NUMERICAL FEATURES  [shape: [6, 50, 13]  = (N=6, T_obs=50, feat=13)]
+   Features per timestep: x, y, vx, vy, cos_θ, sin_θ,  type_one_hot(7)
+--------------------------------------------------------------------------------
+  Slot 0: VEHICLE      | train   | 50/50 valid frames | speed=12.0–15.2 m/s | x:[-70.4,0.0] y:[-0.5,0.7]
+  Slot 1: VEHICLE      | train   | 50/50 valid frames | speed=0.0–0.0 m/s | x:[-0.0,0.0] y:[-0.0,0.0]
+  Slot 2: VEHICLE      | train   | 50/50 valid frames | speed=0.0–0.0 m/s | x:[-0.0,0.0] y:[-0.0,0.0]
+  Slot 3: (padding)
+  Slot 4: (padding)
+  Slot 5: (padding)
+
+--------------------------------------------------------------------------------
+3. LANE NUMERICAL FEATURES   [shape: [20, 10, 8]  = (L=20, pts=10, feat=8)]
+   Features per point: x, y, dx, dy, is_intersect, lane_type(3)
+--------------------------------------------------------------------------------
+  Valid lanes: 20/20 | Intersection lanes: 0 | Lane types: vehicle=200 bike=0 bus=0
+  Spatial range: x:[-13.0,13.0] y:[-0.1,0.1]
+
+--------------------------------------------------------------------------------
+4. inputs_embeds SEQUENCE LAYOUT  (all in LLM hidden space H):
+--------------------------------------------------------------------------------
+  inputs_embeds layout  (total = 263 tokens)
+  Region                         Start   Length     End
+  ----------------------------  ------  -------  ------
+  Text (semantic)                    0      231     230
+  Agent embeddings                 231        6     236
+  Lane embeddings                  237       20     256
+  [AGT] summary tokens             257        6     262
+  ─────────────────────────────────────────────────────
+  TOTAL                              0      263     262
+  AGT token positions: [257, 258, 259, 260, 261, 262]
+
+--------------------------------------------------------------------------------
+6. AGENT SLOT TABLE
+  Slot   traj_id  Type            valid   train   [AGT] pos
+  ----   -------  -----          ------  ------  ----------
+     0         0  VEHICLE          True    True         257
+     1         6  VEHICLE          True    True         258
+     2         3  VEHICLE          True    True         259
+     3        -1  (padding)       False   False         260
+     4        -1  (padding)       False   False         261
+     5        -1  (padding)       False   False         262
+
+================================================================================
+Done.
