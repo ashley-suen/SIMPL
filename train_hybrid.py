@@ -100,9 +100,6 @@ def parse_arguments():
     # Loss
     parser.add_argument("--soft_wta_alpha",  type=float, default=0.1)
     parser.add_argument("--endpoint_weight", type=float, default=0.2)
-    parser.add_argument("--cls_weight",      type=float, default=0.5,
-                        help="Weight for scene-level mode-classification loss "
-                             "(supervises per-mode confidence; needed for brierMinFDE)")
 
     # Optimiser
     parser.add_argument("--llm_lr",    type=float, default=5e-5)
@@ -317,8 +314,7 @@ def main():
     # ── 3. Loss ───────────────────────────────────────────────────────────────
     loss_fn = HybridMotionLoss(n_levels=args.n_levels, device=device,
                                soft_wta_alpha=args.soft_wta_alpha,
-                               endpoint_weight=args.endpoint_weight,
-                               cls_weight=args.cls_weight)
+                               endpoint_weight=args.endpoint_weight)
     if is_main:
         n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in model.parameters())
@@ -442,9 +438,9 @@ def main():
 
             with sync_ctx:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    all_preds, all_scores = model(text_ids, text_mask, ag_feat, ag_valid,
-                                                  lane_feat, lane_valid, gt_anchor)
-                    loss_out  = loss_fn(all_preds, data, all_scores)
+                    all_preds = model(text_ids, text_mask, ag_feat, ag_valid,
+                                     lane_feat, lane_valid, gt_anchor)
+                    loss_out  = loss_fn(all_preds, data)
 
                 (loss_out["loss"] / accum).backward()
 
@@ -523,70 +519,38 @@ def main():
                 gt_anchor = data["gt_anchor"].to(device)
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    all_preds, all_scores = model(text_ids, text_mask, ag_feat, ag_valid,
-                                                  lane_feat, lane_valid, gt_anchor)
-                    loss_out  = loss_fn(all_preds, data, all_scores)
+                    all_preds = model(text_ids, text_mask, ag_feat, ag_valid,
+                                     lane_feat, lane_valid, gt_anchor)
+                    loss_out  = loss_fn(all_preds, data)
 
                 val_meter.update({k: v.item() for k, v in loss_out.items()})
 
-                # ── JOINT scene-level avgMinADE / avgMinFDE over ALL scored agents ──
-                # The K modes are K joint "worlds"; one shared mode per scene is
-                # chosen to minimise the joint error, then ADE/FDE is averaged over
-                # scored agents. Matches the AV2 multi-world avgMinADE(K=6) protocol.
-                pred_disp  = all_preds[-1].float()                              # [B, N, K, T, 2]
-                anchor     = gt_anchor.float()                                  # [B, N, 2]
-                pred_abs   = anchor.unsqueeze(2).unsqueeze(2) + \
-                             pred_disp.cumsum(dim=-2)                           # [B, N, K, T, 2]
-                gt_abs_f   = data["gt_abs_trajectories"].to(device).float()     # [B, N, T, 2]
-                gt_masks_f = data["gt_masks"].to(device)                        # [B, N, T]
-                train_m    = data["train_mask"].to(device)                      # [B, N]
+                # minADE / minFDE — focal agent (slot 0), final level prediction
+                pred_disp = all_preds[-1][:, 0].float()            # [B, K, T, 2]
+                anchor    = gt_anchor[:, 0].float()                  # [B, 2]
+                pred_abs  = anchor.unsqueeze(1).unsqueeze(1) + \
+                            pred_disp.cumsum(dim=-2)                 # [B, K, T, 2]
+                gt_abs_f  = data["gt_abs_trajectories"][:, 0].to(device).float()
+                mask_f    = data["gt_masks"][:, 0].to(device)
+                B_        = pred_abs.shape[0]
 
-                # valid future steps for scored agents only
-                vmask      = (gt_masks_f & train_m.unsqueeze(-1)).float()       # [B, N, T]
-                l2_dist    = (pred_abs - gt_abs_f.unsqueeze(2)).norm(dim=-1)    # [B, N, K, T]
+                valid_per_sample = mask_f.float().sum(dim=1).clamp(min=1)          # [B]
+                l2_dist = (pred_abs - gt_abs_f.unsqueeze(1)).norm(dim=-1)          # [B, K, T]
+                per_mode_ade = (l2_dist * mask_f.unsqueeze(1).float()).sum(dim=2) \
+                               / valid_per_sample.unsqueeze(1)                     # [B, K]
+                min_ade = per_mode_ade.min(dim=1).values.mean()
 
-                # per-agent, per-mode ADE (mean over that agent's valid steps)
-                step_cnt     = vmask.sum(dim=-1).clamp(min=1)                   # [B, N]
-                per_mode_ade = (l2_dist * vmask.unsqueeze(2)).sum(dim=-1) \
-                               / step_cnt.unsqueeze(-1)                         # [B, N, K]
+                last_t    = (mask_f.long().cumsum(1) * mask_f.long()).argmax(1)    # [B]
+                idx_fde   = last_t.unsqueeze(1).unsqueeze(1).expand(-1, pred_abs.shape[1], 1)
+                per_mode_fde = l2_dist.gather(2, idx_fde).squeeze(2)              # [B, K]
+                min_fde   = per_mode_fde.min(dim=1).values.mean()
 
-                # per-agent, per-mode FDE (at that agent's last valid step)
-                last_t       = (gt_masks_f.long().cumsum(-1) *
-                                gt_masks_f.long()).argmax(-1)                   # [B, N]
-                idx_fde      = last_t.unsqueeze(-1).unsqueeze(-1).expand(
-                                   -1, -1, l2_dist.shape[2], 1)                 # [B, N, K, 1]
-                per_mode_fde = l2_dist.gather(3, idx_fde).squeeze(3)            # [B, N, K]
-
-                # scene-level mode aggregation: average over scored agents
-                scored       = train_m.float()                                 # [B, N]
-                agent_cnt    = scored.sum(dim=1).clamp(min=1)                   # [B]
-                scene_ade    = (per_mode_ade * scored.unsqueeze(-1)).sum(dim=1) \
-                               / agent_cnt.unsqueeze(-1)                        # [B, K]
-                scene_fde    = (per_mode_fde * scored.unsqueeze(-1)).sum(dim=1) \
-                               / agent_cnt.unsqueeze(-1)                        # [B, K]
-
-                # pick the single best joint mode per scene, then average over scenes
-                min_ade = scene_ade.min(dim=1).values.mean()
-                min_fde = scene_fde.min(dim=1).values.mean()
-
-                # ── brierMinFDE: minFDE + (1 - p_best)^2, p_best = predicted prob
-                #    of the oracle min-FDE mode. Scene-level confidence is the
-                #    masked mean of per-agent logits over scored agents.
-                scene_logit = (all_scores[-1].float() * scored.unsqueeze(-1)).sum(dim=1) \
-                              / agent_cnt.unsqueeze(-1)                        # [B, K]
-                scene_prob  = torch.softmax(scene_logit, dim=-1)              # [B, K]
-                best_fde_idx = scene_fde.argmin(dim=1)                        # [B]
-                p_best      = scene_prob.gather(1, best_fde_idx.unsqueeze(1)).squeeze(1)  # [B]
-                brier_fde   = (scene_fde.min(dim=1).values + (1.0 - p_best) ** 2).mean()
-
-                ade_meter.update({"minADE": min_ade.item(), "minFDE": min_fde.item(),
-                                  "brierMinFDE": brier_fde.item()})
+                ade_meter.update({"minADE": min_ade.item(), "minFDE": min_fde.item()})
                 if is_main:
                     pbar_v.set_postfix({
                         "loss":   f"{val_meter.metrics['loss'].avg:.4f}",
                         "minADE": f"{ade_meter.metrics['minADE'].avg:.4f}",
                         "minFDE": f"{ade_meter.metrics['minFDE'].avg:.4f}",
-                        "bFDE":   f"{ade_meter.metrics['brierMinFDE'].avg:.4f}",
                     })
 
         pbar_v.close()
@@ -600,25 +564,22 @@ def main():
             val_meter.metrics["loss"].avg,
             ade_meter.metrics["minADE"].avg,
             ade_meter.metrics["minFDE"].avg,
-            ade_meter.metrics["brierMinFDE"].avg,
         ] + [val_meter.metrics[k].avg for k in extra_keys]
         local_tensor  = torch.tensor(local_vals, dtype=torch.float64, device=device)
         global_tensor = distributed_mean(local_tensor)          # collective on every rank
         global_vals   = global_tensor.tolist()
-        val_loss_avg, min_ade_avg, min_fde_avg, brier_fde_avg = global_vals[:4]
-        extra_avgs    = dict(zip(extra_keys, global_vals[4:]))
+        val_loss_avg, min_ade_avg, min_fde_avg = global_vals[:3]
+        extra_avgs    = dict(zip(extra_keys, global_vals[3:]))
 
         if is_main:
             logger.print(
                 f"[Validation] ep {epoch+1} | loss: {val_loss_avg:.4f} | "
                 f"minADE: {min_ade_avg:.4f} m | minFDE: {min_fde_avg:.4f} m | "
-                f"brierMinFDE: {brier_fde_avg:.4f} | "
                 f"time: {(time.time()-val_start)/60:.3f} mins"
             )
-            logger.add_scalar("val/loss",        val_loss_avg,  it=epoch)
-            logger.add_scalar("val/minADE",      min_ade_avg,   it=epoch)
-            logger.add_scalar("val/minFDE",      min_fde_avg,   it=epoch)
-            logger.add_scalar("val/brierMinFDE", brier_fde_avg, it=epoch)
+            logger.add_scalar("val/loss",   val_loss_avg, it=epoch)
+            logger.add_scalar("val/minADE", min_ade_avg,  it=epoch)
+            logger.add_scalar("val/minFDE", min_fde_avg,  it=epoch)
             for k, v in extra_avgs.items():
                 logger.add_scalar(f"val/{k}", v, it=epoch)
 

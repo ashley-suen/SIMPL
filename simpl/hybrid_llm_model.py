@@ -133,12 +133,8 @@ class MLPDecoder(nn.Module):
 
     Per-mode prediction: agent_repr + mode_embedding → MLP → [T, 2].
 
-    Also predicts a per-mode confidence score (logit) so the K modes can be
-    ranked at inference time and scored for joint/brier metrics.
-
     Input:  [BN, H]
-    Output: (disp [BN, K, T, 2]  per-step displacements,
-             score [BN, K]       per-mode logit)
+    Output: [BN, K, T, 2]  per-step displacements
     """
     def __init__(self, hidden_dim, num_modes=6, num_future_steps=60,
                  mlp_hidden=512, dropout=0.1):
@@ -158,22 +154,15 @@ class MLPDecoder(nn.Module):
             nn.Linear(mlp_hidden, num_future_steps * 2),
         )
 
-        # Per-mode confidence head: one logit per (agent, mode)
-        self.score_head = nn.Sequential(
-            nn.Linear(hidden_dim, mlp_hidden), nn.LayerNorm(mlp_hidden), nn.ELU(),
-            nn.Linear(mlp_hidden, 1),
-        )
-
     def forward(self, agent_repr):
         # agent_repr: [BN, H]
         BN, H = agent_repr.shape
         K, T  = self.num_modes, self.num_future_steps
         mode_e = self.mode_embeds(
             torch.arange(K, device=agent_repr.device))           # [K, H]
-        x     = agent_repr.unsqueeze(1) + mode_e.unsqueeze(0)    # [BN, K, H]
-        disp  = self.mlp(x).view(BN, K, T, 2)                    # [BN, K, T, 2]
-        score = self.score_head(x).squeeze(-1)                   # [BN, K]
-        return disp, score
+        x    = agent_repr.unsqueeze(1) + mode_e.unsqueeze(0)     # [BN, K, H]
+        disp = self.mlp(x)                                       # [BN, K, T*2]
+        return disp.view(BN, K, T, 2)
 
 
 # ── Level-k Interaction Decoder ───────────────────────────────────────────────
@@ -280,14 +269,12 @@ class InteractionDecoder(nn.Module):
         h_agents:    [B, N, H]
         gt_anchor:   [B, N, 2]
         agent_valid: [B, N] bool  — propagated to _refine for padding mask
-        Returns:     (all_preds_disp, all_scores)
-                     all_preds_disp: list of [B, N, K, T, 2], length = n_levels + 1
-                     all_scores:     list of [B, N, K],        length = n_levels + 1
+        Returns:     list of [B, N, K, T, 2], length = n_levels + 1
         """
         B, N, H = h_agents.shape
 
         # Level-0: pure encoder-decoder, no interaction (GameFormer: InitialDecoder)
-        traj_disp, score = self.traj_decoder(h_agents.reshape(B * N, H))
+        traj_disp = self.traj_decoder(h_agents.reshape(B * N, H))
         K, T      = traj_disp.shape[1], traj_disp.shape[2]
         traj_disp = traj_disp.reshape(B, N, K, T, 2)
 
@@ -295,58 +282,17 @@ class InteractionDecoder(nn.Module):
         traj_abs = anchor + traj_disp.cumsum(dim=-2)
 
         all_preds_disp = [traj_disp]
-        all_scores     = [score.reshape(B, N, K)]
 
         h_cur = h_agents
         for level_idx in range(self.n_levels):
             h_cur = self._refine(h_cur, traj_abs.detach(), level_idx, agent_valid)
-            traj_disp_k, score_k = self.traj_decoder(h_cur.reshape(B * N, H))
-            traj_disp_k = traj_disp_k.reshape(B, N, K, T, 2)
+            traj_disp_k = self.traj_decoder(
+                h_cur.reshape(B * N, H)).reshape(B, N, K, T, 2)
             traj_abs = anchor + traj_disp_k.cumsum(dim=-2)
             all_preds_disp.append(traj_disp_k)
-            all_scores.append(score_k.reshape(B, N, K))
             h_cur = h_cur.detach()
 
-        return all_preds_disp, all_scores
-
-
-# ── Agent → Lane Cross-Attention ──────────────────────────────────────────────
-
-class LaneCrossAttn(nn.Module):
-    """
-    Lets every agent explicitly query the lane (map) embeddings.
-
-    The LLM only attends to lanes implicitly inside its causal sequence; after the
-    LLM, h_agents has no direct view of lane geometry. This module adds an explicit
-    agent→lane cross-attention so each agent can pull in relevant map context, and
-    — by operating on the NON-detached lane_emb — gives the LaneEncoder a direct
-    gradient path (far stronger than the implicit path through the frozen LLM input).
-
-    Zero-initialized output projection → identity at training start, activates
-    gradually (same pattern as llm_correction_proj / InteractionDecoder.out_projs).
-    Checkpoints without this module load cleanly (strict=False) as identity.
-    """
-    def __init__(self, hidden, dim=128, nhead=4, dropout=0.1):
-        super().__init__()
-        self.q    = nn.Linear(hidden, dim)
-        self.kv   = nn.Linear(hidden, dim)
-        self.attn = nn.MultiheadAttention(dim, nhead, dropout=dropout, batch_first=True)
-        self.out  = nn.Linear(dim, hidden)
-        nn.init.zeros_(self.out.weight)
-        nn.init.zeros_(self.out.bias)
-        self.norm = nn.LayerNorm(hidden)
-
-    def forward(self, h_agents, lane_emb, lane_valid):
-        """
-        h_agents:   [B, N, H]
-        lane_emb:   [B, L, H]   (NOT detached — encoder gets gradient)
-        lane_valid: [B, L] bool — True = real lane, False = padding
-        """
-        q   = self.q(h_agents)                            # [B, N, dim]
-        kv  = self.kv(lane_emb)                            # [B, L, dim]
-        pad = None if lane_valid is None else ~lane_valid  # [B, L], True=ignore
-        ctx, _ = self.attn(q, kv, kv, key_padding_mask=pad)
-        return self.norm(h_agents + self.out(ctx))         # zero-init residual
+        return all_preds_disp   # list of [B, N, K, T, 2], length = n_levels+1
 
 
 # ── Main Model ────────────────────────────────────────────────────────────────
@@ -441,9 +387,6 @@ class HybridLLMPredictor(nn.Module):
 
         # Normalize combined hidden states before decoding
         self.pre_decoder_norm = nn.LayerNorm(H)
-
-        # Explicit agent→lane cross-attention (gives LaneEncoder a direct gradient path)
-        self.lane_cross = LaneCrossAttn(hidden=H, dim=128, nhead=4)
 
         self.interaction = InteractionDecoder(
             traj_decoder=self.traj_decoder, hidden_dim=H,
@@ -543,14 +486,11 @@ class HybridLLMPredictor(nn.Module):
         # Norm first, then mask: LayerNorm of a zero vector yields bias (non-zero
         # after training), so masking must happen AFTER norm to keep padding agents at 0.
         h_agents = self.pre_decoder_norm(agent_emb + h_correction)
-        # Explicit agent→lane cross-attention (uses NON-detached lane_emb so the
-        # LaneEncoder receives a direct gradient). Zero-init residual → identity start.
-        h_agents = self.lane_cross(h_agents, lane_emb, lane_valid)
         h_agents = h_agents * agent_valid.unsqueeze(-1).float()
 
         # ── Level-k interaction decoding ──────────────────────────────────────
-        all_preds, all_scores = self.interaction(h_agents, gt_anchor, agent_valid)
-        return all_preds, all_scores   # lists of [B,N,K,T,2] and [B,N,K]
+        all_preds = self.interaction(h_agents, gt_anchor, agent_valid)
+        return all_preds   # list of [B, N, K, T, 2]
 
 
 # Alias for backward compat

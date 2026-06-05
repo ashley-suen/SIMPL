@@ -242,9 +242,9 @@ def main():
             is_last = ((i + 1) % accum == 0) or ((i + 1) == len(dl_train))
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                all_preds, all_scores = model(text_ids, text_mask, ag_feat, ag_valid,
-                                              lane_feat, lane_valid, gt_anchor)
-                loss_out  = loss_fn(all_preds, data, all_scores)
+                all_preds = model(text_ids, text_mask, ag_feat, ag_valid,
+                                  lane_feat, lane_valid, gt_anchor)
+                loss_out  = loss_fn(all_preds, data)
 
             (loss_out["loss"] / accum).backward()
 
@@ -308,9 +308,9 @@ def main():
                 gt_anchor = data["gt_anchor"].to(device)
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    all_preds, all_scores = model(text_ids, text_mask, ag_feat, ag_valid,
-                                                  lane_feat, lane_valid, gt_anchor)
-                    loss_out  = loss_fn(all_preds, data, all_scores)
+                    all_preds = model(text_ids, text_mask, ag_feat, ag_valid,
+                                     lane_feat, lane_valid, gt_anchor)
+                    loss_out  = loss_fn(all_preds, data)
 
                 val_meter.update({k: v.item() for k, v in loss_out.items()})
 
