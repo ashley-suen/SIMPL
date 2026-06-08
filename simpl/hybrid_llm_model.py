@@ -23,9 +23,11 @@ Gradient design note:
   GMMPredictor is a pure MLP for exactly this reason; we follow the same design.
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from transformers import AutoModel, AutoConfig
 from peft import LoraConfig, get_peft_model, TaskType
 
@@ -118,6 +120,105 @@ class FutureEncoder(nn.Module):
         return out.max(dim=1).values                        # [M, out_dim]
 
 
+# ── Intention Anchor Codebook (VQ-VAE-style online EMA) ───────────────────────
+
+class AnchorCodebook(nn.Module):
+    """
+    VQ-VAE-style EMA codebook of K intention anchors (2-D endpoints, focal frame).
+
+    The anchors are NOT learned by gradient and NOT preset by offline k-means.
+    Instead they track the running distribution of GT endpoints ONLINE: every
+    training step, each scored agent's GT endpoint is hard-assigned to its nearest
+    anchor, and the anchors are moved toward the mean of their assigned endpoints
+    by an exponential moving average — exactly the update VQ-VAE uses for its
+    codebook. This is "online k-means": data-driven, no separate offline pass,
+    and continuously adapting as training proceeds (so nothing is "pre-set").
+
+    Buffers (kept identical across DDP ranks by all_reduce-ing the per-step stats;
+    broadcast_buffers then becomes a no-op):
+      anchors    [K, 2]  current anchor positions  (read by the decoder query)
+      ema_count  [K]     EMA of #assignments per anchor
+      ema_sum    [K, 2]  EMA of summed assigned endpoints
+    Dead anchors (ema_count < reset_thresh) are re-seeded by splitting the most
+    populated anchor — fully deterministic (no RNG) so all ranks stay in sync.
+    """
+    def __init__(self, num_modes, dim=2, radius=15.0,
+                 decay=0.99, eps=1e-5, reset_thresh=1.0):
+        super().__init__()
+        self.num_modes    = num_modes
+        self.decay        = decay
+        self.eps          = eps
+        self.reset_thresh = reset_thresh
+
+        angles = torch.arange(num_modes, dtype=torch.float32) * (2 * math.pi / num_modes)
+        ring   = torch.stack([angles.cos(), angles.sin()], dim=-1) * radius  # [K, 2]
+        init   = ring + torch.randn(num_modes, dim)
+        self.register_buffer("anchors",   init)
+        self.register_buffer("ema_count", torch.ones(num_modes))
+        self.register_buffer("ema_sum",   init.clone())
+
+    @torch.no_grad()
+    def assign(self, ep):
+        """ep [M, 2] → nearest-anchor index [M] (fp32 math)."""
+        a  = self.anchors.float()                                       # [K, 2]
+        d2 = (ep.float().unsqueeze(1) - a.unsqueeze(0)).pow(2).sum(-1)  # [M, K]
+        return d2.argmin(dim=-1)
+
+    @torch.no_grad()
+    def ema_update(self, ep):
+        """
+        ep: [M, 2] GT endpoints of ALL scored agents on THIS rank (already masked).
+        Aggregates the assignment statistics across DDP ranks so every rank applies
+        an identical update — the codebook stays globally consistent and reflects
+        the full (not per-shard) batch.
+        """
+        K, dev = self.num_modes, self.anchors.device
+        if ep.numel() > 0:
+            ep32   = ep.float()
+            idx    = self.assign(ep32)                                  # [M]
+            onehot = F.one_hot(idx, K).float()                          # [M, K]
+            counts = onehot.sum(dim=0)                                  # [K]
+            sums   = onehot.t() @ ep32                                  # [K, 2]
+        else:
+            counts = torch.zeros(K, device=dev)
+            sums   = torch.zeros(K, 2, device=dev)
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(counts)
+            dist.all_reduce(sums)
+
+        # EMA accumulate (fp32 regardless of buffer storage dtype)
+        cnt = self.ema_count.float().mul(self.decay).add(counts, alpha=1 - self.decay)
+        smm = self.ema_sum.float().mul(self.decay).add(sums,   alpha=1 - self.decay)
+        self.ema_count.copy_(cnt)
+        self.ema_sum.copy_(smm)
+
+        # Laplace-smoothed normalization → anchor positions
+        n     = cnt.sum()
+        denom = ((cnt + self.eps) / (n + K * self.eps) * n).clamp(min=self.eps)
+        new_anchors = smm / denom.unsqueeze(-1)                         # [K, 2]
+
+        # Dead-anchor reset: reseed under-used anchors by splitting the most-
+        # populated one (deterministic across ranks — no RNG). The winner itself is
+        # NEVER reseeded (otherwise during EMA warm-up, when every count is still
+        # below the threshold, the winner would be halved each step and the whole
+        # codebook would collapse). Offset uses the absolute anchor index so a
+        # perpetually-dead anchor stays at a fixed split position rather than jittering.
+        big  = int(cnt.argmax())
+        dead = cnt < self.reset_thresh
+        dead[big] = False
+        if bool(dead.any()):
+            for j in dead.nonzero(as_tuple=False).flatten().tolist():
+                ang    = 2 * math.pi * (j + 1) / (self.num_modes + 1)
+                offset = torch.tensor([math.cos(ang), math.sin(ang)],
+                                      device=dev, dtype=new_anchors.dtype) * 2.0
+                new_anchors[j]    = new_anchors[big] + offset
+                self.ema_count[j] = torch.as_tensor(self.reset_thresh, device=dev)
+                self.ema_sum[j]   = new_anchors[j] * self.reset_thresh
+
+        self.anchors.copy_(new_anchors.to(self.anchors.dtype))
+
+
 # ── MLP Trajectory Decoder ────────────────────────────────────────────────────
 
 class MLPDecoder(nn.Module):
@@ -131,13 +232,28 @@ class MLPDecoder(nn.Module):
     This MLP predicts all T×2 displacements in a single forward pass, so the
     gradient w.r.t. every parameter is O(1) — no temporal amplification.
 
-    Per-mode prediction: agent_repr + mode_embedding → MLP → [T, 2].
+    Per-mode prediction: agent_repr + (mode_embedding + anchor_query) → MLP → [T, 2].
+
+    Also predicts a per-mode confidence score (logit) so the K modes can be
+    ranked at inference time and scored for joint/brier metrics.
+
+    Intention anchors (VQ-VAE-style online EMA codebook)
+    ----------------------------------------------------
+    Each mode owns a 2-D endpoint anchor in the (focal-agent) frame, held in an
+    `AnchorCodebook`. The anchor is encoded to H and ADDED to the per-mode query,
+    giving every mode a distinct spatial prior — the mechanism that prevents mode
+    collapse. Anchors are NOT k-means initialized and NOT gradient-learned; they
+    are updated ONLINE by EMA toward the mean of the GT endpoints assigned to them
+    each step (see AnchorCodebook). The loss reads `self.codebook.anchors` (no_grad)
+    to assign each GT endpoint to its nearest anchor for the auxiliary classification
+    term, and triggers the EMA update once per training step.
 
     Input:  [BN, H]
-    Output: [BN, K, T, 2]  per-step displacements
+    Output: (disp [BN, K, T, 2]  per-step displacements,
+             score [BN, K]       per-mode logit)
     """
     def __init__(self, hidden_dim, num_modes=6, num_future_steps=60,
-                 mlp_hidden=512, dropout=0.1):
+                 mlp_hidden=512, dropout=0.1, anchor_radius=15.0):
         super().__init__()
         self.num_modes        = num_modes
         self.num_future_steps = num_future_steps
@@ -145,6 +261,13 @@ class MLPDecoder(nn.Module):
         # Learned per-mode query, added to the agent representation
         self.mode_embeds = nn.Embedding(num_modes, hidden_dim)
         nn.init.normal_(self.mode_embeds.weight, std=0.02)
+
+        # Intention anchors as a VQ-VAE-style online EMA codebook (ring init).
+        # Updated by EMA toward assigned GT endpoints — not gradient, not k-means.
+        self.codebook   = AnchorCodebook(num_modes, dim=2, radius=anchor_radius)
+        self.anchor_mlp = nn.Sequential(
+            nn.Linear(2, hidden_dim), nn.LayerNorm(hidden_dim), nn.ELU(),
+        )
 
         # GameFormer-style MLP head: predict entire trajectory in one shot
         self.mlp = nn.Sequential(
@@ -154,15 +277,27 @@ class MLPDecoder(nn.Module):
             nn.Linear(mlp_hidden, num_future_steps * 2),
         )
 
+        # Per-mode confidence head: one logit per (agent, mode)
+        self.score_head = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_hidden), nn.LayerNorm(mlp_hidden), nn.ELU(),
+            nn.Linear(mlp_hidden, 1),
+        )
+
     def forward(self, agent_repr):
         # agent_repr: [BN, H]
         BN, H = agent_repr.shape
         K, T  = self.num_modes, self.num_future_steps
-        mode_e = self.mode_embeds(
+        base_q   = self.mode_embeds(
             torch.arange(K, device=agent_repr.device))           # [K, H]
-        x    = agent_repr.unsqueeze(1) + mode_e.unsqueeze(0)     # [BN, K, H]
-        disp = self.mlp(x)                                       # [BN, K, T*2]
-        return disp.view(BN, K, T, 2)
+        # .clone() → fresh tensor, so the codebook's in-place EMA update (after the
+        # forward, before backward) can't corrupt the autograd-saved query input.
+        anchor_q = self.anchor_mlp(
+            self.codebook.anchors.clone().to(agent_repr.dtype))   # [K, H]
+        mode_e   = base_q + anchor_q                             # [K, H]
+        x     = agent_repr.unsqueeze(1) + mode_e.unsqueeze(0)    # [BN, K, H]
+        disp  = self.mlp(x).view(BN, K, T, 2)                    # [BN, K, T, 2]
+        score = self.score_head(x).squeeze(-1)                   # [BN, K]
+        return disp, score
 
 
 # ── Level-k Interaction Decoder ───────────────────────────────────────────────
@@ -269,12 +404,14 @@ class InteractionDecoder(nn.Module):
         h_agents:    [B, N, H]
         gt_anchor:   [B, N, 2]
         agent_valid: [B, N] bool  — propagated to _refine for padding mask
-        Returns:     list of [B, N, K, T, 2], length = n_levels + 1
+        Returns:     (all_preds_disp, all_scores)
+                     all_preds_disp: list of [B, N, K, T, 2], length = n_levels + 1
+                     all_scores:     list of [B, N, K],        length = n_levels + 1
         """
         B, N, H = h_agents.shape
 
         # Level-0: pure encoder-decoder, no interaction (GameFormer: InitialDecoder)
-        traj_disp = self.traj_decoder(h_agents.reshape(B * N, H))
+        traj_disp, score = self.traj_decoder(h_agents.reshape(B * N, H))
         K, T      = traj_disp.shape[1], traj_disp.shape[2]
         traj_disp = traj_disp.reshape(B, N, K, T, 2)
 
@@ -282,17 +419,58 @@ class InteractionDecoder(nn.Module):
         traj_abs = anchor + traj_disp.cumsum(dim=-2)
 
         all_preds_disp = [traj_disp]
+        all_scores     = [score.reshape(B, N, K)]
 
         h_cur = h_agents
         for level_idx in range(self.n_levels):
             h_cur = self._refine(h_cur, traj_abs.detach(), level_idx, agent_valid)
-            traj_disp_k = self.traj_decoder(
-                h_cur.reshape(B * N, H)).reshape(B, N, K, T, 2)
+            traj_disp_k, score_k = self.traj_decoder(h_cur.reshape(B * N, H))
+            traj_disp_k = traj_disp_k.reshape(B, N, K, T, 2)
             traj_abs = anchor + traj_disp_k.cumsum(dim=-2)
             all_preds_disp.append(traj_disp_k)
+            all_scores.append(score_k.reshape(B, N, K))
             h_cur = h_cur.detach()
 
-        return all_preds_disp   # list of [B, N, K, T, 2], length = n_levels+1
+        return all_preds_disp, all_scores
+
+
+# ── Agent → Lane Cross-Attention ──────────────────────────────────────────────
+
+class LaneCrossAttn(nn.Module):
+    """
+    Lets every agent explicitly query the lane (map) embeddings.
+
+    The LLM only attends to lanes implicitly inside its causal sequence; after the
+    LLM, h_agents has no direct view of lane geometry. This module adds an explicit
+    agent→lane cross-attention so each agent can pull in relevant map context, and
+    — by operating on the NON-detached lane_emb — gives the LaneEncoder a direct
+    gradient path (far stronger than the implicit path through the frozen LLM input).
+
+    Zero-initialized output projection → identity at training start, activates
+    gradually (same pattern as llm_correction_proj / InteractionDecoder.out_projs).
+    Checkpoints without this module load cleanly (strict=False) as identity.
+    """
+    def __init__(self, hidden, dim=128, nhead=4, dropout=0.1):
+        super().__init__()
+        self.q    = nn.Linear(hidden, dim)
+        self.kv   = nn.Linear(hidden, dim)
+        self.attn = nn.MultiheadAttention(dim, nhead, dropout=dropout, batch_first=True)
+        self.out  = nn.Linear(dim, hidden)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+        self.norm = nn.LayerNorm(hidden)
+
+    def forward(self, h_agents, lane_emb, lane_valid):
+        """
+        h_agents:   [B, N, H]
+        lane_emb:   [B, L, H]   (NOT detached — encoder gets gradient)
+        lane_valid: [B, L] bool — True = real lane, False = padding
+        """
+        q   = self.q(h_agents)                            # [B, N, dim]
+        kv  = self.kv(lane_emb)                            # [B, L, dim]
+        pad = None if lane_valid is None else ~lane_valid  # [B, L], True=ignore
+        ctx, _ = self.attn(q, kv, kv, key_padding_mask=pad)
+        return self.norm(h_agents + self.out(ctx))         # zero-init residual
 
 
 # ── Main Model ────────────────────────────────────────────────────────────────
@@ -388,9 +566,21 @@ class HybridLLMPredictor(nn.Module):
         # Normalize combined hidden states before decoding
         self.pre_decoder_norm = nn.LayerNorm(H)
 
+        # Explicit agent→lane cross-attention (gives LaneEncoder a direct gradient path)
+        self.lane_cross = LaneCrossAttn(hidden=H, dim=128, nhead=4)
+
         self.interaction = InteractionDecoder(
             traj_decoder=self.traj_decoder, hidden_dim=H,
             cross_attn_dim=128, nhead=4, n_levels=n_levels)
+
+        # Diagnostics (updated each forward, no grad): relative magnitude of the
+        # LLM correction vs the encoder identity path, and of the lane-cross
+        # contribution. These reveal whether the LLM branch is actually doing
+        # anything or is still a near-zero residual (llm_correction_proj is
+        # zero-init, so a ratio that stays tiny means the LLM is a no-op and the
+        # whole prediction is carried by the MLP encoder alone).
+        self.diag_corr_ratio = 0.0
+        self.diag_lane_ratio = 0.0
 
         if device is not None:
             self.to(device)
@@ -443,7 +633,10 @@ class HybridLLMPredictor(nn.Module):
             lane_valid:          [B, L]  bool
             gt_anchor:           [B, N, 2]
         Returns:
-            all_preds: list of [B, N, K, T, 2], length = n_levels + 1
+            all_preds:  list of [B, N, K, T, 2], length = n_levels + 1
+            all_scores: list of [B, N, K],        length = n_levels + 1
+            codebook:   AnchorCodebook  (its .anchors [K,2] feed the loss; the loss
+                        also triggers its EMA update once per training step)
         """
         B = text_input_ids.shape[0]
         N = agent_features.shape[1]
@@ -485,12 +678,28 @@ class HybridLLMPredictor(nn.Module):
         h_correction = self.llm_correction_proj(h_llm)                  # [B, N, H]
         # Norm first, then mask: LayerNorm of a zero vector yields bias (non-zero
         # after training), so masking must happen AFTER norm to keep padding agents at 0.
-        h_agents = self.pre_decoder_norm(agent_emb + h_correction)
-        h_agents = h_agents * agent_valid.unsqueeze(-1).float()
+        h_pre = self.pre_decoder_norm(agent_emb + h_correction)
+        # Explicit agent→lane cross-attention (uses NON-detached lane_emb so the
+        # LaneEncoder receives a direct gradient). Zero-init residual → identity start.
+        h_post = self.lane_cross(h_pre, lane_emb, lane_valid)
+        h_agents = h_post * agent_valid.unsqueeze(-1).float()
+
+        # ── Branch-contribution diagnostics (no grad, valid agents only) ──────
+        # corr_ratio = ‖LLM correction‖ / ‖encoder identity‖  (before pre_norm)
+        # lane_ratio = ‖lane_cross delta‖ / ‖its input‖       (after pre_norm)
+        with torch.no_grad():
+            vm    = agent_valid.unsqueeze(-1).float()
+            enc_n = (agent_emb * vm).norm().clamp(min=1e-6)
+            pre_n = (h_pre     * vm).norm().clamp(min=1e-6)
+            self.diag_corr_ratio = ((h_correction * vm).norm() / enc_n).item()
+            self.diag_lane_ratio = (((h_post - h_pre) * vm).norm() / pre_n).item()
 
         # ── Level-k interaction decoding ──────────────────────────────────────
-        all_preds = self.interaction(h_agents, gt_anchor, agent_valid)
-        return all_preds   # list of [B, N, K, T, 2]
+        all_preds, all_scores = self.interaction(h_agents, gt_anchor, agent_valid)
+        # The anchor codebook is shared across levels; returned so the loss can
+        # assign each GT endpoint to its nearest anchor (B2 anchor-cls term) and
+        # drive the online EMA update once per training step.
+        return all_preds, all_scores, self.traj_decoder.codebook
 
 
 # Alias for backward compat

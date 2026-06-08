@@ -85,6 +85,11 @@ def parse_arguments():
     # Loss
     parser.add_argument("--soft_wta_alpha",  type=float, default=0.1)
     parser.add_argument("--endpoint_weight", type=float, default=0.2)
+    parser.add_argument("--pos_weight",      type=float, default=0.1,
+                        help="Weight for position-space SmoothL1 loss on the cumsum'd "
+                             "trajectory (all K modes, soft-WTA). NOTE: cumsum backward "
+                             "makes the effective grad weight ~T× nominal; 0.1 already "
+                             "dominates reg. Set 0.0 to disable.")
 
     # Optimiser
     parser.add_argument("--llm_lr",           type=float, default=5e-5)
@@ -179,7 +184,8 @@ def main():
     # ── Loss ──────────────────────────────────────────────────────────────────
     loss_fn = HybridMotionLoss(n_levels=args.n_levels, device=device,
                                soft_wta_alpha=args.soft_wta_alpha,
-                               endpoint_weight=args.endpoint_weight)
+                               endpoint_weight=args.endpoint_weight,
+                               pos_weight=args.pos_weight)
     logger.print(f"Loss: HybridMotionLoss n_levels={args.n_levels} | "
                  f"level_weights={loss_fn.level_weights}")
 
@@ -242,9 +248,9 @@ def main():
             is_last = ((i + 1) % accum == 0) or ((i + 1) == len(dl_train))
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                all_preds = model(text_ids, text_mask, ag_feat, ag_valid,
-                                  lane_feat, lane_valid, gt_anchor)
-                loss_out  = loss_fn(all_preds, data)
+                all_preds, all_scores, codebook = model(text_ids, text_mask, ag_feat, ag_valid,
+                                                        lane_feat, lane_valid, gt_anchor)
+                loss_out  = loss_fn(all_preds, data, all_scores, codebook)
 
             (loss_out["loss"] / accum).backward()
 
@@ -308,9 +314,9 @@ def main():
                 gt_anchor = data["gt_anchor"].to(device)
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    all_preds = model(text_ids, text_mask, ag_feat, ag_valid,
-                                     lane_feat, lane_valid, gt_anchor)
-                    loss_out  = loss_fn(all_preds, data)
+                    all_preds, all_scores, codebook = model(text_ids, text_mask, ag_feat, ag_valid,
+                                                            lane_feat, lane_valid, gt_anchor)
+                    loss_out  = loss_fn(all_preds, data, all_scores, codebook)
 
                 val_meter.update({k: v.item() for k, v in loss_out.items()})
 
@@ -347,6 +353,24 @@ def main():
             f"minADE={min_ade:.4f}m | minFDE={min_fde:.4f}m | "
             f"time={(time.time()-val_start)/60:.2f}min"
         )
+
+        # ── LLM / lane branch contribution (is the LLM actually working?) ─────
+        _corr = getattr(model, "diag_corr_ratio", float("nan"))
+        _lane = getattr(model, "diag_lane_ratio", float("nan"))
+        logger.print(f"[Branch] ep {epoch+1} | LLM corr/enc: {_corr:.4f} "
+                     f"| lane_cross/input: {_lane:.4f}")
+
+        # ── Anchor codebook diagnostics ──────────────────────────────────────
+        cb      = model.traj_decoder.codebook
+        anc     = cb.anchors.float().cpu()                          # [K, 2]
+        cnt     = cb.ema_count.float().cpu()                        # [K]
+        pdist   = torch.cdist(anc, anc)
+        pdist.fill_diagonal_(float("inf"))
+        min_sep = pdist.min().item()
+        logger.print(f"[Anchors] ep {epoch+1} | min pairwise sep: {min_sep:.3f} m")
+        for j in range(anc.shape[0]):
+            logger.print(f"    anchor[{j}] = ({anc[j,0]:+7.2f}, {anc[j,1]:+7.2f}) "
+                         f"| ema_count = {cnt[j]:8.2f}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
