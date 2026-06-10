@@ -112,9 +112,7 @@ class FutureEncoder(nn.Module):
 
     Replaces GRU to eliminate 60-step BPTT gradient amplification.
     Features: (x, y, dx, dy) per step → MLP → MaxPool over T.
-    Input is detached both by the caller AND internally (GameFormer pattern).
-
-    Input:  [M, T, 2]   absolute trajectory (detached by caller)
+    Input:  [M, T, 2]   absolute trajectory
     Output: [M, out_dim]
     """
     def __init__(self, out_dim=128):
@@ -125,10 +123,10 @@ class FutureEncoder(nn.Module):
         )
 
     def forward(self, traj):
-        # traj: [M, T, 2] — caller must detach; we also detach inside (GameFormer)
+        # traj: [M, T, 2]
         vel  = torch.diff(traj, dim=1)                      # [M, T-1, 2]
         feat = torch.cat([traj[:, 1:], vel], dim=-1)        # [M, T-1, 4]
-        out  = self.mlp(feat.detach())                      # detach inside too
+        out  = self.mlp(feat)                                # Bezier: no cumsum amplification, safe e2e
         return out.max(dim=1).values                        # [M, out_dim]
 
 
@@ -381,7 +379,7 @@ class InteractionDecoder(nn.Module):
     def _refine(self, h_agents, prev_trajs, level_idx, agent_valid=None):
         """
         h_agents:    [B, N, H]
-        prev_trajs:  [B, N, K, T, 2]  — detached by caller
+        prev_trajs:  [B, N, K, T, 2]  — gradient-connected (e2e; Bezier makes this safe)
         agent_valid: [B, N] bool       — mask padding agents from self-attention KV
         Returns:     [B, N, H]
         """
@@ -444,13 +442,15 @@ class InteractionDecoder(nn.Module):
 
         h_cur = h_agents
         for level_idx in range(self.n_levels):
-            h_cur = self._refine(h_cur, traj_abs.detach(), level_idx, agent_valid)
+            # E2E: traj_abs and h_cur are NOT detached — gradient flows back through
+            # FutureEncoder (trajectory context) and across levels to the decoder.
+            # Safe with Bezier (no cumsum amplification) and n_levels<=2 (short chain).
+            h_cur = self._refine(h_cur, traj_abs, level_idx, agent_valid)
             traj_pos_k, score_k = self.traj_decoder(h_cur.reshape(B * N, H))
             traj_pos_k = traj_pos_k.reshape(B, N, K, T, 2)
             traj_abs   = anchor + traj_pos_k
             all_preds.append(traj_pos_k)
             all_scores.append(score_k.reshape(B, N, K))
-            h_cur = h_cur.detach()
 
         return all_preds, all_scores
 

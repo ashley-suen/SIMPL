@@ -190,10 +190,11 @@ def main():
                  f"level_weights={loss_fn.level_weights}")
 
     # ── Optimiser ─────────────────────────────────────────────────────────────
+    _slow_keywords = ("llm.",  "llm_correction_proj")
     llm_params = [p for n, p in model.named_parameters()
-                  if p.requires_grad and "llm." in n]
+                  if p.requires_grad and any(k in n for k in _slow_keywords)]
     enc_params = [p for n, p in model.named_parameters()
-                  if p.requires_grad and "llm." not in n]
+                  if p.requires_grad and not any(k in n for k in _slow_keywords)]
     optimizer = AdamW([
         {"params": llm_params, "lr": args.llm_lr},
         {"params": enc_params, "lr": args.gru_lr},

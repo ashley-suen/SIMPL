@@ -349,10 +349,15 @@ def main():
                      f"({'encoder-only, LLM correction zeroed' if args.llm_correction_scale == 0.0 else 'normal LLM path'})")
 
     # ── 4. Optimiser (Differential LR) ────────────────────────────────────────
+    # llm_correction_proj bridges LLM→encoder space; it must be in the slow group
+    # (llm_lr) alongside LoRA. If placed in enc_params (gru_lr=2× faster), it
+    # outpaces the LoRA weights that produce h_llm, amplifying random LLM noise
+    # into the encoder before the LLM has converged (diag_corr_ratio >> 1 at ep1).
+    _slow_keywords = ("llm.",  "llm_correction_proj")
     llm_params = [p for n, p in model.named_parameters()
-                  if p.requires_grad and "llm." in n]
+                  if p.requires_grad and any(k in n for k in _slow_keywords)]
     enc_params = [p for n, p in model.named_parameters()
-                  if p.requires_grad and "llm." not in n]
+                  if p.requires_grad and not any(k in n for k in _slow_keywords)]
     optimizer = AdamW([
         {"params": llm_params, "lr": args.llm_lr},
         {"params": enc_params, "lr": args.gru_lr},
