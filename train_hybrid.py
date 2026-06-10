@@ -84,8 +84,11 @@ def parse_arguments():
 
     # Model
     parser.add_argument("--model_name",  type=str, default="Qwen/Qwen3-0.6B-Base")
-    parser.add_argument("--num_modes",   type=int, default=6)
-    parser.add_argument("--n_levels",    type=int, default=2,
+    parser.add_argument("--num_modes",     type=int, default=6)
+    parser.add_argument("--n_bezier_ctrl", type=int, default=6,
+                        help="Number of Bézier control points per mode (degree = n-1). "
+                             "6 control points (degree 5) covers straight/lane-change/turn.")
+    parser.add_argument("--n_levels",      type=int, default=2,
                         help="Number of Level-k interaction refinement rounds")
 
     # LoRA
@@ -98,24 +101,22 @@ def parse_arguments():
                              "list (e.g. 'q_proj,v_proj') for selective targeting.")
 
     # Loss
-    parser.add_argument("--soft_wta_alpha",  type=float, default=0.1)
-    parser.add_argument("--endpoint_weight", type=float, default=0.2)
-    parser.add_argument("--cls_weight",      type=float, default=0.5,
+    parser.add_argument("--soft_wta_alpha",    type=float, default=0.1)
+    parser.add_argument("--cls_weight",        type=float, default=0.5,
                         help="Weight for scene-level mode-classification loss "
                              "(supervises per-mode confidence; needed for brierMinFDE)")
     parser.add_argument("--anchor_cls_weight", type=float, default=0.5,
                         help="Weight for per-agent anchor-classification loss (B2): "
                              "hard-assigns each GT endpoint to its nearest learnable "
                              "anchor — the multi-modal diversity regulariser")
-    parser.add_argument("--pos_weight", type=float, default=0.1,
-                        help="Weight for position-space SmoothL1 loss on the cumsum'd "
-                             "trajectory (all K modes, soft-WTA). Supervises accumulated "
-                             "positions directly — the space minADE/minFDE live in. "
-                             "NOTE: cumsum backward is reverse-cumsum, so the EFFECTIVE "
-                             "gradient weight is ~T× the nominal value (early steps "
-                             "amplified up to T=60×). 0.1 already makes pos dominate "
-                             "reg by ~5-10×; raise cautiously and watch gn_enc. "
-                             "Set 0.0 to disable.")
+
+    # Ablation
+    parser.add_argument("--llm_correction_scale", type=float, default=1.0,
+                        help="Scale applied to the LLM correction before adding to "
+                             "agent_emb (Route A ablation). 1.0 = normal. 0.0 = "
+                             "encoder-only (LLM correction zeroed out; LLM LoRA grad "
+                             "is also killed since d_loss/d_h_correction=0). Use 0.0 "
+                             "to test whether LLM dominance is capping minADE.")
 
     # Optimiser
     parser.add_argument("--llm_lr",    type=float, default=5e-5)
@@ -298,7 +299,7 @@ def main():
             lora_dropout=args.lora_dropout,
             n_levels=args.n_levels,
             max_agents=args.max_agents, max_lanes=args.max_lanes,
-            num_modes=args.num_modes,
+            num_modes=args.num_modes, n_bezier_ctrl=args.n_bezier_ctrl,
             use_flash_attn=use_flash_attn, dtype=torch.bfloat16)
         model = model.to(device).to(torch.bfloat16)
         if os.path.exists(lock_file): os.remove(lock_file)
@@ -315,13 +316,18 @@ def main():
             lora_dropout=args.lora_dropout,
             n_levels=args.n_levels,
             max_agents=args.max_agents, max_lanes=args.max_lanes,
-            num_modes=args.num_modes,
+            num_modes=args.num_modes, n_bezier_ctrl=args.n_bezier_ctrl,
             use_flash_attn=use_flash_attn, dtype=torch.bfloat16)
         model = model.to(device).to(torch.bfloat16)
 
     dist.barrier()
     model = DDP(model, device_ids=[local_rank], output_device=local_rank,
                 find_unused_parameters=True)
+
+    # Route-A ablation: set LLM correction scale on the underlying module so it
+    # survives DDP wrapping.  scale=0.0 → encoder-only (LLM correction zeroed).
+    (model.module if isinstance(model, DDP) else model).llm_correction_scale = \
+        args.llm_correction_scale
 
     if args.compile:
         model = torch.compile(model, mode=args.compile_mode, dynamic=False)
@@ -330,10 +336,8 @@ def main():
     # ── 3. Loss ───────────────────────────────────────────────────────────────
     loss_fn = HybridMotionLoss(n_levels=args.n_levels, device=device,
                                soft_wta_alpha=args.soft_wta_alpha,
-                               endpoint_weight=args.endpoint_weight,
                                cls_weight=args.cls_weight,
-                               anchor_cls_weight=args.anchor_cls_weight,
-                               pos_weight=args.pos_weight)
+                               anchor_cls_weight=args.anchor_cls_weight)
     if is_main:
         n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in model.parameters())
@@ -341,6 +345,8 @@ def main():
                      f"({100.*n_train/max(n_total,1):.2f}%)")
         logger.print(f"Loss: Level-k HybridMotionLoss | n_levels={args.n_levels} | "
                      f"weights={loss_fn.level_weights}")
+        logger.print(f"[Ablation] llm_correction_scale={args.llm_correction_scale} "
+                     f"({'encoder-only, LLM correction zeroed' if args.llm_correction_scale == 0.0 else 'normal LLM path'})")
 
     # ── 4. Optimiser (Differential LR) ────────────────────────────────────────
     llm_params = [p for n, p in model.named_parameters()
@@ -550,10 +556,9 @@ def main():
                 # The K modes are K joint "worlds"; one shared mode per scene is
                 # chosen to minimise the joint error, then ADE/FDE is averaged over
                 # scored agents. Matches the AV2 multi-world avgMinADE(K=6) protocol.
-                pred_disp  = all_preds[-1].float()                              # [B, N, K, T, 2]
+                pred_pos   = all_preds[-1].float()                              # [B, N, K, T, 2]
                 anchor     = gt_anchor.float()                                  # [B, N, 2]
-                pred_abs   = anchor.unsqueeze(2).unsqueeze(2) + \
-                             pred_disp.cumsum(dim=-2)                           # [B, N, K, T, 2]
+                pred_abs   = anchor.unsqueeze(2).unsqueeze(2) + pred_pos        # [B, N, K, T, 2]
                 gt_abs_f   = data["gt_abs_trajectories"].to(device).float()     # [B, N, T, 2]
                 gt_masks_f = data["gt_masks"].to(device)                        # [B, N, T]
                 train_m    = data["train_mask"].to(device)                      # [B, N]

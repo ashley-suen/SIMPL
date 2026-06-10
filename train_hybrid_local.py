@@ -71,9 +71,11 @@ def parse_arguments():
     parser.add_argument("--logger_writer",     action="store_true")
 
     # Model
-    parser.add_argument("--model_name",  type=str, default="Qwen/Qwen3-0.6B-Base")
-    parser.add_argument("--num_modes",   type=int, default=6)
-    parser.add_argument("--n_levels",    type=int, default=2)
+    parser.add_argument("--model_name",    type=str, default="Qwen/Qwen3-0.6B-Base")
+    parser.add_argument("--num_modes",     type=int, default=6)
+    parser.add_argument("--n_levels",      type=int, default=2)
+    parser.add_argument("--n_bezier_ctrl", type=int, default=6,
+                        help="Number of Bezier control points per mode (degree K-1).")
 
     # LoRA
     parser.add_argument("--lora_r",       type=int,   default=16)
@@ -82,14 +84,11 @@ def parse_arguments():
     parser.add_argument("--lora_targets", type=str,
                         default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
 
-    # Loss
-    parser.add_argument("--soft_wta_alpha",  type=float, default=0.1)
-    parser.add_argument("--endpoint_weight", type=float, default=0.2)
-    parser.add_argument("--pos_weight",      type=float, default=0.1,
-                        help="Weight for position-space SmoothL1 loss on the cumsum'd "
-                             "trajectory (all K modes, soft-WTA). NOTE: cumsum backward "
-                             "makes the effective grad weight ~T× nominal; 0.1 already "
-                             "dominates reg. Set 0.0 to disable.")
+    # Loss (Bezier: reg_loss is position-space SmoothL1, no cumsum; pos/endpoint
+    #        weights removed — they were displacement-era terms)
+    parser.add_argument("--soft_wta_alpha",    type=float, default=0.1)
+    parser.add_argument("--cls_weight",        type=float, default=0.5)
+    parser.add_argument("--anchor_cls_weight", type=float, default=0.5)
 
     # Optimiser
     parser.add_argument("--llm_lr",           type=float, default=5e-5)
@@ -167,11 +166,12 @@ def main():
     model = HybridLLMPredictor(
         model_name=args.model_name,
         lora_r=args.lora_r, lora_alpha=args.lora_alpha,
-        lora_target_modules=args.lora_targets.split(","),
+        lora_target_modules=args.lora_targets if args.lora_targets == "all-linear"
+                            else args.lora_targets.split(","),
         lora_dropout=args.lora_dropout,
         n_levels=args.n_levels,
         max_agents=args.max_agents, max_lanes=args.max_lanes,
-        num_modes=args.num_modes,
+        num_modes=args.num_modes, n_bezier_ctrl=args.n_bezier_ctrl,
         use_flash_attn=False,       # disabled for local compatibility
         dtype=torch.bfloat16)
     model = model.to(device).to(torch.bfloat16)
@@ -184,8 +184,8 @@ def main():
     # ── Loss ──────────────────────────────────────────────────────────────────
     loss_fn = HybridMotionLoss(n_levels=args.n_levels, device=device,
                                soft_wta_alpha=args.soft_wta_alpha,
-                               endpoint_weight=args.endpoint_weight,
-                               pos_weight=args.pos_weight)
+                               cls_weight=args.cls_weight,
+                               anchor_cls_weight=args.anchor_cls_weight)
     logger.print(f"Loss: HybridMotionLoss n_levels={args.n_levels} | "
                  f"level_weights={loss_fn.level_weights}")
 
@@ -321,10 +321,10 @@ def main():
                 val_meter.update({k: v.item() for k, v in loss_out.items()})
 
                 # minADE / minFDE (focal agent, final level)
-                pred_disp = all_preds[-1][:, 0].float()
+                # Bezier: all_preds[-1] are direct position offsets (no cumsum)
+                pred_pos  = all_preds[-1][:, 0].float()
                 anchor_f  = gt_anchor[:, 0].float()
-                pred_abs  = anchor_f.unsqueeze(1).unsqueeze(1) + \
-                            pred_disp.cumsum(dim=-2)
+                pred_abs  = anchor_f.unsqueeze(1).unsqueeze(1) + pred_pos
                 gt_abs_f  = data["gt_abs_trajectories"][:, 0].to(device).float()
                 mask_f    = data["gt_masks"][:, 0].to(device)
                 B_        = pred_abs.shape[0]

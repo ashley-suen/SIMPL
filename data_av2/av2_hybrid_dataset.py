@@ -1,7 +1,8 @@
 """
 AV2 Hybrid Dataset — returns compact semantic text tokens + numerical embeddings.
 
-Text portion  : scene labels + intention + affordance + focal dynamics +
+Text portion  : scene labels + focal intention + [MAP CONTEXT]
+                (non-redundant map semantics) + focal dynamics +
                 surrounding agents context (all semantic, NO coordinate steps)
 Numerical portion:
   agent_features [N, T_obs, 13]  = (x,y,vx,vy,cos_θ,sin_θ) + type_one_hot(7)
@@ -216,12 +217,14 @@ class AV2HybridDataset(Dataset):
 
     # ── Scene text (all semantic, no coordinate steps) ───────────────────────
 
-    def _build_scene_text(self, df_row):
+    def compose_scene_text(self, df_row):
         """
-        Generate compact semantic text:
-          scene header + labels + intention + affordances + focal dynamics
-          + surrounding agents context (type, distance, speed, influence).
+        Compose the semantic scene text (no tokenization):
+          scene header + labels + [FOCAL INTENTION] + [MAP CONTEXT]
+          (non-redundant map semantics) + focal dynamics + surrounding agents.
+        Map Affordance is dropped (redundant with [MAP CONTEXT]); intention kept.
         Stops at [AGENT TRAJECTORIES] header. NO coordinate step tokens.
+        Returns (text, selected_neighbor_ids).
         """
         seq_id    = df_row["SEQ_ID"]
         city_name = df_row["CITY_NAME"]
@@ -267,7 +270,7 @@ class AV2HybridDataset(Dataset):
             })
         neighbors_info.sort(key=lambda x: x["influence_score"], reverse=True)
 
-        labels, intention, affordances = \
+        labels, intention, _affordances = \
             self._identify_scenarios_and_intention(fk, lane_graph, neighbors_info)
 
         # Focal dynamics
@@ -281,8 +284,14 @@ class AV2HybridDataset(Dataset):
 
         text  = f"Scenario '{seq_id}' in {city_name}. Task: High-Fidelity Motion Prediction.\n"
         text += f"[SCENARIO IDENTIFICATION]\nLabels: {', '.join(labels)}\n\n"
-        text += (f"[AFFORDANCE & INTENTION]\nFocal Agent Intention: {intention}\n"
-                 f"Map Affordance: {', '.join(affordances)}\n\n")
+        # Map Affordance dropped: now redundant with [MAP CONTEXT] (lane boundaries,
+        # intersection, crossability). Intention (from focal kinematics) is kept.
+        text += f"[FOCAL INTENTION]\nFocal Agent Intention: {intention}\n\n"
+        # [MAP CONTEXT]: non-redundant map semantics extracted at preprocess time.
+        # Old pkls without this field degrade gracefully (block omitted).
+        map_ctx = df_row.get("MAP_CONTEXT", "") if hasattr(df_row, "get") else ""
+        if isinstance(map_ctx, str) and map_ctx.strip():
+            text += f"[MAP CONTEXT]\n{map_ctx}\n\n"
         text += (f"[FOCAL DYNAMICS]\n"
                  f"Speed: {fk['first_speed']:.1f}→{fk['last_speed']:.1f}m/s "
                  f"({speed_trend}) | Heading: {heading_desc}\n\n")
@@ -311,11 +320,16 @@ class AV2HybridDataset(Dataset):
 
         text += "[AGENT TRAJECTORIES]\n"
 
+        return text, [n["id"] for n in selected]  # neighbor ids for ordering
+
+    def _build_scene_text(self, df_row):
+        """Tokenize the composed scene text (thin wrapper over compose_scene_text)."""
+        text, selected_ids = self.compose_scene_text(df_row)
         enc = self.tokenizer(text, truncation=True, max_length=self.max_text_len,
                              padding="max_length", return_tensors="pt")
         return (enc["input_ids"].squeeze(0),
                 enc["attention_mask"].squeeze(0),
-                [n["id"] for n in selected])  # neighbor ids for ordering
+                selected_ids)
 
     # ── Numerical features ────────────────────────────────────────────────────
 

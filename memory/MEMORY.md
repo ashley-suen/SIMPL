@@ -1,1 +1,5 @@
 - [TODO: remove detach for end-to-end](todo-remove-detach-end2end.md) — planned high-ROI change to co-train encoder+LLM, do after #1/#3/#4
+- [Cloud DDP: use gloo](cloud-ddp-use-gloo.md) — nccl errors on the cloud platform (bug); always pass --dist_backend gloo
+- [Experiment launch convention](exp-launch-convention.md) — expN naming, batch/LR, --reset_optimizer on resume, anchor diagnostics
+- [Experiments run on cloud](experiments-run-on-cloud.md) — all training is cloud-side; local is code/debug only; sync before runs
+- [paper/ is reference-only](paper-folder-reference-only.md) — don't traverse paper/ for code work; user will flag when to consult it

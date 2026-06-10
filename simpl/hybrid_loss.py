@@ -13,8 +13,7 @@ from simpl.av2_llm_loss import LLMMotionLoss
 
 class HybridMotionLoss(nn.Module):
     def __init__(self, n_levels=2, device="cuda",
-                 soft_wta_alpha=0.1, endpoint_weight=0.2, cls_weight=0.5,
-                 anchor_cls_weight=0.5, pos_weight=0.1):
+                 soft_wta_alpha=0.1, cls_weight=0.5, anchor_cls_weight=0.5):
         """
         n_levels: number of interaction refinement levels (NOT counting level-0).
                   Total prediction outputs = n_levels + 1.
@@ -23,10 +22,8 @@ class HybridMotionLoss(nn.Module):
         self.base_loss = LLMMotionLoss(
             device=device,
             soft_wta_alpha=soft_wta_alpha,
-            endpoint_weight=endpoint_weight,
             cls_weight=cls_weight,
             anchor_cls_weight=anchor_cls_weight,
-            pos_weight=pos_weight,
         )
         # Weights: early levels get half the weight of the final level
         n_total = n_levels + 1
@@ -57,8 +54,6 @@ class HybridMotionLoss(nn.Module):
             w   = self.level_weights[k]
             loss_dict[f"loss_l{k}"]            = out["loss"]
             loss_dict[f"reg_loss_l{k}"]        = out["reg_loss"]
-            loss_dict[f"pos_loss_l{k}"]        = out["pos_loss"]
-            loss_dict[f"ep_loss_l{k}"]         = out["ep_loss"]
             loss_dict[f"cls_loss_l{k}"]        = out["cls_loss"]
             loss_dict[f"anchor_cls_loss_l{k}"] = out["anchor_cls_loss"]
             if total_loss is None:

@@ -3,6 +3,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from shapely.geometry import LineString
+from collections import Counter
 #
 from av2.map.map_api import ArgoverseStaticMap
 from av2.map.lane_segment import LaneType, LaneMarkType
@@ -18,6 +19,185 @@ _ESTIMATED_PEDESTRIAN_LENGTH_M = 0.3
 _ESTIMATED_PEDESTRIAN_WIDTH_M = 0.5
 _ESTIMATED_BUS_LENGTH_M = 7.0
 _ESTIMATED_BUS_WIDTH_M = 2.1
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# [MAP CONTEXT] extraction — non-redundant map semantics for the LLM text prompt.
+# These come from the official AV2 ArgoverseStaticMap API and are NOT derivable
+# from the numerical agent/lane channels (data-processing-inequality fix).
+# ──────────────────────────────────────────────────────────────────────────────
+
+_TYPE_LABEL = {
+    ObjectType.VEHICLE:           "vehicle",
+    ObjectType.PEDESTRIAN:        "pedestrian",
+    ObjectType.CYCLIST:           "cyclist",
+    ObjectType.MOTORCYCLIST:      "motorcyclist",
+    ObjectType.BUS:               "bus",
+    ObjectType.STATIC:            "static object",
+    ObjectType.CONSTRUCTION:      "construction object",
+    ObjectType.RIDERLESS_BICYCLE: "riderless bicycle",
+    ObjectType.BACKGROUND:        "background object",
+    ObjectType.UNKNOWN:           "unknown object",
+}
+
+# display order for the agent-type distribution line
+_TYPE_ORDER = ["vehicle", "bus", "motorcyclist", "cyclist", "riderless bicycle",
+               "pedestrian", "construction object", "static object",
+               "background object", "unknown object", "other"]
+
+
+def _pluralize(label, n):
+    return f"{n} {label}" + ("s" if n != 1 else "")
+
+
+def _to_local(pts_xy, orig, rot):
+    return (np.asarray(pts_xy) - orig).dot(rot)
+
+
+def _mark_semantic(side, mt):
+    name = mt.name
+    if "YELLOW" in name and "SOLID" in name and "DASH" not in name:
+        sem = "oncoming traffic divider, no crossing"
+    elif "SOLID_WHITE" in name or "DOUBLE_SOLID_WHITE" in name:
+        sem = "same-direction, lane change discouraged"
+    elif "DASH" in name:
+        sem = "lane change permitted"
+    else:
+        sem = "no marking"
+    return f"Focal lane {side} boundary: {name.lower().replace('_', ' ')} ({sem})."
+
+
+def _pick_focal_lane(static_map, focal_xy, focal_theta):
+    """Nearest lane segment whose centerline direction aligns with focal heading."""
+    near = static_map.get_nearby_lane_segments(focal_xy, 5.0)
+    best, best_score = None, 1e9
+    fdir = np.array([np.cos(focal_theta), np.sin(focal_theta)])
+    for ls in near:
+        cl = static_map.get_lane_segment_centerline(ls.id)[:, :2]
+        d = np.min(np.linalg.norm(cl - focal_xy, axis=1))
+        seg = cl[-1] - cl[0]
+        n = np.linalg.norm(seg)
+        if n < 1e-6:
+            continue
+        align = np.dot(seg / n, fdir)            # +1 same direction
+        if align < 0.0:                          # opposite direction lane — skip
+            continue
+        score = d - 2.0 * align                  # prefer near + aligned
+        if score < best_score:
+            best, best_score = ls, score
+    return best
+
+
+def _centerline_len(static_map, lane_id):
+    cl = static_map.get_lane_segment_centerline(lane_id)[:, :2]
+    return float(np.sum(np.linalg.norm(np.diff(cl, axis=0), axis=1)))
+
+
+def _trace_route_topology(static_map, focal_ls, max_dist=50.0):
+    """Walk successors forward; report distance to first fork / merge."""
+    id2seg = {s.id: s for s in static_map.get_scenario_lane_segments()}
+    fork_d = merge_d = None
+    cur, dist, hops = focal_ls, 0.0, 0
+    while cur is not None and dist < max_dist and hops < 8:
+        if fork_d is None and len(cur.successors) >= 2:
+            fork_d = dist
+        succs = [id2seg[s] for s in cur.successors if s in id2seg]
+        # merge: a downstream segment fed by >=2 lanes
+        for s in succs:
+            if merge_d is None and len(s.predecessors) >= 2:
+                merge_d = dist + _centerline_len(static_map, cur.id)
+        if not succs:
+            break
+        dist += _centerline_len(static_map, cur.id)
+        cur = succs[0]
+        hops += 1
+    return fork_d, merge_d
+
+
+def _focal_motion_state(fk):
+    """Classify focal's OBSERVED motion (no future leakage)."""
+    fs, ls = fk["first_speed"], fk["last_speed"]
+    if ls < 0.5:
+        return "stopped", ls
+    sd = ls - fs
+    if sd > 0.8:
+        return "accelerating", ls
+    if sd < -0.8:
+        return "decelerating", ls
+    return "constant", ls
+
+
+def _ped_crossing_interp(motion):
+    """Behavior-conditioned interpretation of an upcoming ped crossing."""
+    return {
+        "stopped":      "focal already stopped at/near it - waiting for pedestrians",
+        "decelerating": "focal decelerating on approach - likely to yield/stop",
+        "accelerating": "focal accelerating - likely proceeding through before pedestrians",
+        "constant":     "focal at constant speed - may proceed or yield depending on pedestrians",
+    }[motion]
+
+
+def _lateral_word(cy):
+    if cy > 3.0:   return "ahead-left"
+    if cy < -3.0:  return "ahead-right"
+    return "directly ahead"
+
+
+def _count_pedestrians(scenario, orig, rot, obs_len):
+    """Count pedestrian/cyclist agents observed at t=obs-1, ahead within 30m."""
+    n_ahead = 0
+    for tr in scenario.tracks:
+        if tr.object_type not in (ObjectType.PEDESTRIAN, ObjectType.CYCLIST,
+                                   ObjectType.MOTORCYCLIST):
+            continue
+        st = {s.timestep: s for s in tr.object_states}.get(obs_len - 1)
+        if st is None:
+            continue
+        loc = (np.asarray(st.position) - orig).dot(rot)
+        if loc[0] > 0 and np.linalg.norm(loc) < 30.0:
+            n_ahead += 1
+    return n_ahead
+
+
+def _agent_type_distribution(scenario, orig, rot, obs_len, radius=50.0):
+    """Count ALL observed agents by type within radius (beyond the top-6 selected)."""
+    c = Counter()
+    for tr in scenario.tracks:
+        if tr.track_id == scenario.focal_track_id:
+            continue
+        st = {s.timestep: s for s in tr.object_states}.get(obs_len - 1)
+        if st is None:
+            continue
+        loc = (np.asarray(st.position) - orig).dot(rot)
+        if np.linalg.norm(loc) > radius:
+            continue
+        c[_TYPE_LABEL.get(tr.object_type, "other")] += 1
+    return c
+
+
+def _drivable_edge_distance(static_map, focal_xy):
+    """Min distance from focal to any drivable-area boundary point (≈ road edge)."""
+    best = None
+    for da in static_map.get_scenario_vector_drivable_areas():
+        pts = da.xyz[:, :2]
+        d = float(np.min(np.linalg.norm(pts - focal_xy, axis=1)))
+        if best is None or d < best:
+            best = d
+    return best
+
+
+def _intersection_distance(static_map, focal_xy):
+    """Distance to nearest intersection lane (proxy for intersection proximity)."""
+    near = static_map.get_nearby_lane_segments(focal_xy, 40.0)
+    best = None
+    for ls in near:
+        if not ls.is_intersection:
+            continue
+        cl = static_map.get_lane_segment_centerline(ls.id)[:, :2]
+        d = float(np.min(np.linalg.norm(cl - focal_xy, axis=1)))
+        if best is None or d < best:
+            best = d
+    return best
 
 
 class ArgoPreprocAV2():
@@ -101,9 +281,12 @@ class ArgoPreprocAV2():
         # ~ get lane graph
         lane_graph = self.get_lane_graph(seq_id, orig_seq, rot_seq, static_map)
 
+        # ~ get map context text (non-redundant map semantics for LLM prompt)
+        map_context = self.build_map_context(scenario, static_map, orig_seq, rot_seq, theta_seq, trajs)
+
         # collect data
-        data = [[seq_id, city_name, orig_seq, rot_seq, trajs, lane_graph]]
-        headers = ["SEQ_ID", "CITY_NAME", "ORIG", "ROT", "TRAJS", "LANE_GRAPH"]
+        data = [[seq_id, city_name, orig_seq, rot_seq, trajs, lane_graph, map_context]]
+        headers = ["SEQ_ID", "CITY_NAME", "ORIG", "ROT", "TRAJS", "LANE_GRAPH", "MAP_CONTEXT"]
 
         # ! For debug
         if self.debug:
@@ -125,6 +308,98 @@ class ArgoPreprocAV2():
         rot = np.array([[np.cos(theta), -np.sin(theta)],
                         [np.sin(theta), np.cos(theta)]])
         return orig, rot, theta
+
+    def _focal_first_last_speed(self, trajs):
+        """First/last observed focal speed (mirrors dataset _extract_focal_kinematics)."""
+        has = trajs["has_flags"][0, :self.args.obs_len].astype(bool)
+        vel = trajs["trajs_vel"][0, :self.args.obs_len][has]
+        if len(vel) == 0:
+            return 0.0, 0.0
+        sp = np.linalg.norm(vel, axis=1)
+        valid = sp[sp > 0.1]
+        first = float(valid[0]) if len(valid) else 0.0
+        last = float(sp[-1])
+        return first, last
+
+    def build_map_context(self, scenario, static_map, orig, rot, theta, trajs):
+        """Compose the [MAP CONTEXT] text — non-redundant map semantics from the
+        official AV2 API. orig/rot/theta = focal frame at t=obs-1 (focal_xy == orig)."""
+        obs_len = self.args.obs_len
+        focal_xy, focal_theta = orig, theta
+        first_speed, last_speed = self._focal_first_last_speed(trajs)
+        fk = {"first_speed": first_speed, "last_speed": last_speed}
+        motion, _ = _focal_motion_state(fk)
+        lines = []
+
+        # 1) Pedestrian crossings ahead (behavior-conditioned, with lateral + count)
+        pcs = static_map.get_scenario_ped_crossings()
+        ahead_pcs = []
+        for pc in pcs:
+            loc = _to_local(pc.polygon[:, :2], orig, rot)        # focal frame: +x ahead
+            d = float(np.min(np.linalg.norm(loc, axis=1)))
+            if loc[:, 0].mean() > 0 and d < 30.0:
+                ahead_pcs.append((d, loc[:, 1].mean()))
+        if ahead_pcs:
+            ahead_pcs.sort()
+            d, cy = ahead_pcs[0]
+            extra = f" ({len(ahead_pcs)} crossings ahead)" if len(ahead_pcs) > 1 else ""
+            lines.append(f"Pedestrian crossing {d:.1f}m {_lateral_word(cy)}{extra} - "
+                         f"{_ped_crossing_interp(motion)}.")
+
+        # 2) Pedestrians / VRUs physically present ahead
+        n_ped = _count_pedestrians(scenario, orig, rot, obs_len)
+        if n_ped > 0:
+            lines.append(f"{n_ped} vulnerable road user(s) (pedestrian/cyclist) "
+                         f"observed ahead within 30m.")
+
+        # 2b) Nearby agent type distribution (ALL agents within 50m, not just top-6)
+        dist = _agent_type_distribution(scenario, orig, rot, obs_len, radius=50.0)
+        if dist:
+            total = sum(dist.values())
+            parts = [_pluralize(k, dist[k]) for k in _TYPE_ORDER if dist.get(k)]
+            lines.append(f"Nearby agents within 50m: {', '.join(parts)} ({total} total).")
+
+        # 2c) Spatial: distance to road edge (drivable-area boundary)
+        edge_d = _drivable_edge_distance(static_map, focal_xy)
+        if edge_d is not None:
+            if edge_d < 2.0:
+                lines.append(f"Focal ~{edge_d:.1f}m from road edge/curb - "
+                             f"near boundary (parking/edge lane).")
+            else:
+                lines.append(f"Focal ~{edge_d:.1f}m from nearest road edge - "
+                             f"interior of drivable area.")
+
+        # 3) Intersection proximity
+        int_d = _intersection_distance(static_map, focal_xy)
+        if int_d is not None:
+            if int_d < 3.0:
+                lines.append("Focal currently inside an intersection - right-of-way rules apply.")
+            elif int_d < 25.0:
+                lines.append(f"Intersection ~{int_d:.0f}m ahead - expect cross-traffic / signals.")
+
+        # 4) Focal-lane boundary semantics (keep BOTH incl. 'no marking')
+        focal_ls = _pick_focal_lane(static_map, focal_xy, focal_theta)
+        if focal_ls is not None:
+            lines.append(_mark_semantic("left",  focal_ls.left_mark_type))
+            lines.append(_mark_semantic("right", focal_ls.right_mark_type))
+            if focal_ls.lane_type != LaneType.VEHICLE:
+                lines.append(f"Focal in dedicated {focal_ls.lane_type.name} lane, "
+                             f"expect specific dynamics.")
+            # 5) Route topology — emit fork / merge ordered by distance (nearest first)
+            fork_d, merge_d = _trace_route_topology(static_map, focal_ls)
+            topo = []
+            if fork_d is not None:
+                where = "immediately ahead" if fork_d < 3.0 else f"in ~{fork_d:.0f}m"
+                topo.append((fork_d,
+                             f"Focal lane forks {where} - route ambiguity (turn vs straight)."))
+            if merge_d is not None:
+                topo.append((merge_d,
+                             f"Focal lane merges with another in ~{merge_d:.0f}m - "
+                             f"merging conflict possible."))
+            for _, ln in sorted(topo, key=lambda x: x[0]):
+                lines.append(ln)
+
+        return "\n".join(lines) if lines else "Map: standard road segment, no special features."
 
     def get_trajectories(self, scenario, static_map):
         # * find idcs

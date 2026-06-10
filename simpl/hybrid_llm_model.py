@@ -30,6 +30,18 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from transformers import AutoModel, AutoConfig
 from peft import LoraConfig, get_peft_model, TaskType
+from math import comb as _math_comb
+
+
+def _make_bezier_basis(n_ctrl: int, n_steps: int) -> torch.Tensor:
+    """Precomputed Bézier basis [n_steps, n_ctrl] for a degree-(n_ctrl-1) curve."""
+    n = n_ctrl - 1
+    t = torch.linspace(0.0, 1.0, n_steps)
+    basis = torch.zeros(n_steps, n_ctrl)
+    for i in range(n_ctrl):
+        c = _math_comb(n, i)
+        basis[:, i] = c * (t ** i) * ((1.0 - t) ** (n - i))
+    return basis
 
 
 # ── Agent Encoder ─────────────────────────────────────────────────────────────
@@ -249,14 +261,15 @@ class MLPDecoder(nn.Module):
     term, and triggers the EMA update once per training step.
 
     Input:  [BN, H]
-    Output: (disp [BN, K, T, 2]  per-step displacements,
+    Output: (traj [BN, K, T, 2]  position offsets from anchor (Bézier decoded),
              score [BN, K]       per-mode logit)
     """
     def __init__(self, hidden_dim, num_modes=6, num_future_steps=60,
-                 mlp_hidden=512, dropout=0.1, anchor_radius=15.0):
+                 mlp_hidden=512, dropout=0.1, anchor_radius=15.0, n_bezier_ctrl=6):
         super().__init__()
         self.num_modes        = num_modes
         self.num_future_steps = num_future_steps
+        self.n_bezier_ctrl    = n_bezier_ctrl
 
         # Learned per-mode query, added to the agent representation
         self.mode_embeds = nn.Embedding(num_modes, hidden_dim)
@@ -269,12 +282,12 @@ class MLPDecoder(nn.Module):
             nn.Linear(2, hidden_dim), nn.LayerNorm(hidden_dim), nn.ELU(),
         )
 
-        # GameFormer-style MLP head: predict entire trajectory in one shot
+        # MLP head: predict n_bezier_ctrl control points per mode (Bézier parameterisation)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, mlp_hidden), nn.LayerNorm(mlp_hidden), nn.ELU(),
             nn.Dropout(dropout),
             nn.Linear(mlp_hidden, mlp_hidden), nn.LayerNorm(mlp_hidden), nn.ELU(),
-            nn.Linear(mlp_hidden, num_future_steps * 2),
+            nn.Linear(mlp_hidden, n_bezier_ctrl * 2),
         )
 
         # Per-mode confidence head: one logit per (agent, mode)
@@ -283,10 +296,14 @@ class MLPDecoder(nn.Module):
             nn.Linear(mlp_hidden, 1),
         )
 
+        # Precomputed Bézier basis [T, n_bezier_ctrl] — no gradient
+        self.register_buffer('bezier_basis',
+                             _make_bezier_basis(n_bezier_ctrl, num_future_steps))
+
     def forward(self, agent_repr):
         # agent_repr: [BN, H]
         BN, H = agent_repr.shape
-        K, T  = self.num_modes, self.num_future_steps
+        K     = self.num_modes
         base_q   = self.mode_embeds(
             torch.arange(K, device=agent_repr.device))           # [K, H]
         # .clone() → fresh tensor, so the codebook's in-place EMA update (after the
@@ -294,10 +311,13 @@ class MLPDecoder(nn.Module):
         anchor_q = self.anchor_mlp(
             self.codebook.anchors.clone().to(agent_repr.dtype))   # [K, H]
         mode_e   = base_q + anchor_q                             # [K, H]
-        x     = agent_repr.unsqueeze(1) + mode_e.unsqueeze(0)    # [BN, K, H]
-        disp  = self.mlp(x).view(BN, K, T, 2)                    # [BN, K, T, 2]
-        score = self.score_head(x).squeeze(-1)                   # [BN, K]
-        return disp, score
+        x        = agent_repr.unsqueeze(1) + mode_e.unsqueeze(0) # [BN, K, H]
+        ctrl     = self.mlp(x).view(BN, K, self.n_bezier_ctrl, 2)# [BN, K, n_ctrl, 2]
+        # Bézier decode: C∞-smooth position offsets from anchor (no cumsum)
+        traj     = torch.einsum('tc,bkcd->bktd',
+                                self.bezier_basis.to(ctrl.dtype), ctrl)  # [BN, K, T, 2]
+        score    = self.score_head(x).squeeze(-1)                # [BN, K]
+        return traj, score
 
 
 # ── Level-k Interaction Decoder ───────────────────────────────────────────────
@@ -404,34 +424,35 @@ class InteractionDecoder(nn.Module):
         h_agents:    [B, N, H]
         gt_anchor:   [B, N, 2]
         agent_valid: [B, N] bool  — propagated to _refine for padding mask
-        Returns:     (all_preds_disp, all_scores)
-                     all_preds_disp: list of [B, N, K, T, 2], length = n_levels + 1
-                     all_scores:     list of [B, N, K],        length = n_levels + 1
+        Returns:     (all_preds, all_scores)
+                     all_preds:  list of [B, N, K, T, 2] position offsets from anchor,
+                                 length = n_levels + 1
+                     all_scores: list of [B, N, K], length = n_levels + 1
         """
         B, N, H = h_agents.shape
 
         # Level-0: pure encoder-decoder, no interaction (GameFormer: InitialDecoder)
-        traj_disp, score = self.traj_decoder(h_agents.reshape(B * N, H))
-        K, T      = traj_disp.shape[1], traj_disp.shape[2]
-        traj_disp = traj_disp.reshape(B, N, K, T, 2)
+        traj_pos, score = self.traj_decoder(h_agents.reshape(B * N, H))
+        K, T     = traj_pos.shape[1], traj_pos.shape[2]
+        traj_pos = traj_pos.reshape(B, N, K, T, 2)
 
         anchor   = gt_anchor.unsqueeze(2).unsqueeze(2)           # [B, N, 1, 1, 2]
-        traj_abs = anchor + traj_disp.cumsum(dim=-2)
+        traj_abs = anchor + traj_pos                             # direct position, no cumsum
 
-        all_preds_disp = [traj_disp]
-        all_scores     = [score.reshape(B, N, K)]
+        all_preds  = [traj_pos]
+        all_scores = [score.reshape(B, N, K)]
 
         h_cur = h_agents
         for level_idx in range(self.n_levels):
             h_cur = self._refine(h_cur, traj_abs.detach(), level_idx, agent_valid)
-            traj_disp_k, score_k = self.traj_decoder(h_cur.reshape(B * N, H))
-            traj_disp_k = traj_disp_k.reshape(B, N, K, T, 2)
-            traj_abs = anchor + traj_disp_k.cumsum(dim=-2)
-            all_preds_disp.append(traj_disp_k)
+            traj_pos_k, score_k = self.traj_decoder(h_cur.reshape(B * N, H))
+            traj_pos_k = traj_pos_k.reshape(B, N, K, T, 2)
+            traj_abs   = anchor + traj_pos_k
+            all_preds.append(traj_pos_k)
             all_scores.append(score_k.reshape(B, N, K))
             h_cur = h_cur.detach()
 
-        return all_preds_disp, all_scores
+        return all_preds, all_scores
 
 
 # ── Agent → Lane Cross-Attention ──────────────────────────────────────────────
@@ -497,6 +518,7 @@ class HybridLLMPredictor(nn.Module):
                  max_lanes=20,
                  num_modes=6,
                  num_future_steps=60,
+                 n_bezier_ctrl=6,
                  gru_hidden=256,
                  gru_layers=2,
                  use_flash_attn=True,
@@ -560,7 +582,8 @@ class HybridLLMPredictor(nn.Module):
         # ── Decoder (feedforward MLP — no BPTT, see MLPDecoder docstring) ──────
         self.traj_decoder = MLPDecoder(
             hidden_dim=H, num_modes=num_modes,
-            num_future_steps=num_future_steps, mlp_hidden=gru_hidden * 2)
+            num_future_steps=num_future_steps, mlp_hidden=gru_hidden * 2,
+            n_bezier_ctrl=n_bezier_ctrl)
         self.traj_decoder = self.traj_decoder.to(dtype)
 
         # Normalize combined hidden states before decoding
@@ -581,6 +604,13 @@ class HybridLLMPredictor(nn.Module):
         # whole prediction is carried by the MLP encoder alone).
         self.diag_corr_ratio = 0.0
         self.diag_lane_ratio = 0.0
+
+        # Ablation knob: scale applied to llm_correction_proj output before adding
+        # to agent_emb.  1.0 = normal operation.  0.0 = encoder-only (LLM correction
+        # is zeroed out; gradient to LLM/llm_correction_proj is also zero, so LLM
+        # LoRA effectively freezes even without setting llm_lr=0).
+        # Set via train_hybrid.py --llm_correction_scale for diagnostic ablation runs.
+        self.llm_correction_scale = 1.0
 
         if device is not None:
             self.to(device)
@@ -675,7 +705,7 @@ class HybridLLMPredictor(nn.Module):
         # Gradient path to LLM LoRA:    loss → decoder → h_correction → h_llm → LoRA (long)
         # llm_correction_proj is zero-initialized → LLM contributes 0 at training start,
         # letting the encoder converge first before LLM refinement activates.
-        h_correction = self.llm_correction_proj(h_llm)                  # [B, N, H]
+        h_correction = self.llm_correction_proj(h_llm) * self.llm_correction_scale  # [B, N, H]
         # Norm first, then mask: LayerNorm of a zero vector yields bias (non-zero
         # after training), so masking must happen AFTER norm to keep padding agents at 0.
         h_pre = self.pre_decoder_norm(agent_emb + h_correction)
