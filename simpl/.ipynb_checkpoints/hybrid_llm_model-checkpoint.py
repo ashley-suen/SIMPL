@@ -30,18 +30,6 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from transformers import AutoModel, AutoConfig
 from peft import LoraConfig, get_peft_model, TaskType
-from math import comb as _math_comb
-
-
-def _make_bezier_basis(n_ctrl: int, n_steps: int) -> torch.Tensor:
-    """Precomputed Bézier basis [n_steps, n_ctrl] for a degree-(n_ctrl-1) curve."""
-    n = n_ctrl - 1
-    t = torch.linspace(0.0, 1.0, n_steps)
-    basis = torch.zeros(n_steps, n_ctrl)
-    for i in range(n_ctrl):
-        c = _math_comb(n, i)
-        basis[:, i] = c * (t ** i) * ((1.0 - t) ** (n - i))
-    return basis
 
 
 # ── Agent Encoder ─────────────────────────────────────────────────────────────
@@ -112,7 +100,9 @@ class FutureEncoder(nn.Module):
 
     Replaces GRU to eliminate 60-step BPTT gradient amplification.
     Features: (x, y, dx, dy) per step → MLP → MaxPool over T.
-    Input:  [M, T, 2]   absolute trajectory
+    Input is detached both by the caller AND internally (GameFormer pattern).
+
+    Input:  [M, T, 2]   absolute trajectory (detached by caller)
     Output: [M, out_dim]
     """
     def __init__(self, out_dim=128):
@@ -123,10 +113,10 @@ class FutureEncoder(nn.Module):
         )
 
     def forward(self, traj):
-        # traj: [M, T, 2]
+        # traj: [M, T, 2] — caller must detach; we also detach inside (GameFormer)
         vel  = torch.diff(traj, dim=1)                      # [M, T-1, 2]
         feat = torch.cat([traj[:, 1:], vel], dim=-1)        # [M, T-1, 4]
-        out  = self.mlp(feat)                                # Bezier: no cumsum amplification, safe e2e
+        out  = self.mlp(feat.detach())                      # detach inside too
         return out.max(dim=1).values                        # [M, out_dim]
 
 
@@ -233,83 +223,58 @@ class AnchorCodebook(nn.Module):
 
 class MLPDecoder(nn.Module):
     """
-    Feedforward multi-modal trajectory decoder — Scenario-Query Joint variant.
+    Feedforward multi-modal trajectory decoder — aligned with GameFormer's
+    GMMPredictor (Linear→ELU→Linear, predicting the WHOLE trajectory at once).
 
     Replaces the previous GRUDecoder. A GRU decoder backprops through T=60
     timesteps (BPTT), causing the gradient on its recurrent weight W_hh to
     accumulate ~60×, which was the dominant source of gradient explosion.
-    This MLP predicts all control points in a single forward pass, so the
+    This MLP predicts all T×2 displacements in a single forward pass, so the
     gradient w.r.t. every parameter is O(1) — no temporal amplification.
 
-    Scenario queries (exp12)
-    ------------------------
-    Mode k is a scene-level JOINT scenario, not a per-agent endpoint anchor:
-        mode_e[k] = base_q[k] + scene_proj(h_scn)[k] * scene_guidance_scale
-    where h_scn is the LLM's [SCN] scene-summary hidden state. scene_proj is
-    zero-initialised, so training starts from pure learned queries and the LLM's
-    scene understanding activates gradually (same pattern as llm_correction_proj).
-    This replaces the previous agent-INDEPENDENT anchor injection, which conflicted
-    with the scene-shared winner mode of the joint protocol (one anchor ray cannot
-    fit heterogeneous agents simultaneously).
+    Per-mode prediction: agent_repr + (mode_embedding + anchor_query) → MLP → [T, 2].
 
-    CV-prior residual Bézier control points (exp12)
-    -----------------------------------------------
-    The MLP no longer regresses absolute control points (0–90 m span vs O(1) m
-    init — badly conditioned). Instead, each agent's constant-velocity rollout
-    provides per-agent prior control points placed uniformly along its velocity
-    ray (a straight line is a degree-elevated linear Bézier, so this reproduces
-    exact constant-velocity motion). The MLP predicts metre-scale residuals:
-        ctrl = v_last ⊗ ctrl_times  +  MLP(x)
-    The prior is agent-conditioned (each agent's own velocity), so it is
-    compatible with scene-shared joint modes — unlike the old shared anchors.
+    Also predicts a per-mode confidence score (logit) so the K modes can be
+    ranked at inference time and scored for joint/brier metrics.
 
-    AnchorCodebook is retained as a pure DIAGNOSTIC (tracks the GT endpoint
-    distribution online for logging); it no longer feeds the forward pass or loss.
+    Intention anchors (VQ-VAE-style online EMA codebook)
+    ----------------------------------------------------
+    Each mode owns a 2-D endpoint anchor in the (focal-agent) frame, held in an
+    `AnchorCodebook`. The anchor is encoded to H and ADDED to the per-mode query,
+    giving every mode a distinct spatial prior — the mechanism that prevents mode
+    collapse. Anchors are NOT k-means initialized and NOT gradient-learned; they
+    are updated ONLINE by EMA toward the mean of the GT endpoints assigned to them
+    each step (see AnchorCodebook). The loss reads `self.codebook.anchors` (no_grad)
+    to assign each GT endpoint to its nearest anchor for the auxiliary classification
+    term, and triggers the EMA update once per training step.
 
-    Input:  agent_repr [BN, H], v_last [BN, 2], h_scn [B, H]
-    Output: (traj [BN, K, T, 2]  position offsets from current position,
+    Input:  [BN, H]
+    Output: (disp [BN, K, T, 2]  per-step displacements,
              score [BN, K]       per-mode logit)
     """
     def __init__(self, hidden_dim, num_modes=6, num_future_steps=60,
-                 mlp_hidden=512, dropout=0.1, anchor_radius=15.0, n_bezier_ctrl=6,
-                 horizon_sec=6.0):
+                 mlp_hidden=512, dropout=0.1, anchor_radius=15.0):
         super().__init__()
         self.num_modes        = num_modes
         self.num_future_steps = num_future_steps
-        self.n_bezier_ctrl    = n_bezier_ctrl
 
         # Learned per-mode query, added to the agent representation
         self.mode_embeds = nn.Embedding(num_modes, hidden_dim)
         nn.init.normal_(self.mode_embeds.weight, std=0.02)
 
-        # LLM scene-guidance projection: h_scn [B,H] → K per-mode query deltas.
-        # Zero-init → scenarios start as pure base_q; LLM guidance activates
-        # gradually. scene_guidance_scale=0.0 is the exp12-A ablation switch.
-        self.scene_proj = nn.Linear(hidden_dim, num_modes * hidden_dim)
-        nn.init.zeros_(self.scene_proj.weight)
-        nn.init.zeros_(self.scene_proj.bias)
-        self.scene_guidance_scale = 1.0
-        self.diag_scn_ratio = 0.0   # ‖scene query delta‖ / ‖base_q‖, no grad
+        # Intention anchors as a VQ-VAE-style online EMA codebook (ring init).
+        # Updated by EMA toward assigned GT endpoints — not gradient, not k-means.
+        self.codebook   = AnchorCodebook(num_modes, dim=2, radius=anchor_radius)
+        self.anchor_mlp = nn.Sequential(
+            nn.Linear(2, hidden_dim), nn.LayerNorm(hidden_dim), nn.ELU(),
+        )
 
-        # Endpoint-distribution diagnostic only (EMA online k-means of GT
-        # endpoints). NOT used in the forward pass or the loss any more.
-        self.codebook = AnchorCodebook(num_modes, dim=2, radius=anchor_radius)
-
-        # CV-prior control-point times: ctrl point i sits at time
-        #   t_i = dt + (horizon - dt) * i/(n-1),  dt = horizon/num_steps
-        # so that with C_i = v * t_i the decoded Bézier reproduces exact
-        # constant-velocity positions at every future step (step j is at (j+1)·dt).
-        dt = horizon_sec / num_future_steps
-        ctrl_times = dt + (horizon_sec - dt) * \
-            torch.arange(n_bezier_ctrl, dtype=torch.float32) / (n_bezier_ctrl - 1)
-        self.register_buffer('ctrl_times', ctrl_times)   # [n_ctrl], seconds
-
-        # MLP head: predict n_bezier_ctrl control points per mode (Bézier parameterisation)
+        # GameFormer-style MLP head: predict entire trajectory in one shot
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, mlp_hidden), nn.LayerNorm(mlp_hidden), nn.ELU(),
             nn.Dropout(dropout),
             nn.Linear(mlp_hidden, mlp_hidden), nn.LayerNorm(mlp_hidden), nn.ELU(),
-            nn.Linear(mlp_hidden, n_bezier_ctrl * 2),
+            nn.Linear(mlp_hidden, num_future_steps * 2),
         )
 
         # Per-mode confidence head: one logit per (agent, mode)
@@ -318,49 +283,21 @@ class MLPDecoder(nn.Module):
             nn.Linear(mlp_hidden, 1),
         )
 
-        # Precomputed Bézier basis [T, n_bezier_ctrl] — no gradient
-        self.register_buffer('bezier_basis',
-                             _make_bezier_basis(n_bezier_ctrl, num_future_steps))
-
-    def forward(self, agent_repr, v_last, h_scn):
-        """
-        agent_repr: [BN, H]  fused agent features
-        v_last:     [BN, 2]  last observed velocity (focal frame, m/s)
-        h_scn:      [B, H]   LLM [SCN] scene-summary hidden state
-        """
+    def forward(self, agent_repr):
+        # agent_repr: [BN, H]
         BN, H = agent_repr.shape
-        K     = self.num_modes
-        B     = h_scn.shape[0]
-        N     = BN // B
-
-        base_q = self.mode_embeds(
+        K, T  = self.num_modes, self.num_future_steps
+        base_q   = self.mode_embeds(
             torch.arange(K, device=agent_repr.device))           # [K, H]
-        # LLM scene guidance: K per-mode query deltas from the scene summary
-        scn_q  = self.scene_proj(h_scn).view(B, K, H)            # [B, K, H]
-        mode_e = base_q.unsqueeze(0) \
-               + scn_q * self.scene_guidance_scale               # [B, K, H]
-        mode_e = mode_e.unsqueeze(1).expand(-1, N, -1, -1) \
-                       .reshape(BN, K, H)                        # [BN, K, H]
-
-        with torch.no_grad():
-            self.diag_scn_ratio = (scn_q.norm() /
-                                   base_q.norm().clamp(min=1e-6)).item()
-
-        x        = agent_repr.unsqueeze(1) + mode_e              # [BN, K, H]
-        res_ctrl = self.mlp(x).view(BN, K, self.n_bezier_ctrl, 2)# residual, ~metres
-
-        # CV prior: ctrl point i = v_last * t_i → decoded Bézier is the exact
-        # constant-velocity rollout (Bernstein linear precision). Per-agent and
-        # heading-aware; the MLP only predicts the deviation from it.
-        cv_ctrl = v_last.to(res_ctrl.dtype).view(BN, 1, 1, 2) * \
-                  self.ctrl_times.to(res_ctrl.dtype).view(1, 1, -1, 1)  # [BN,1,n_ctrl,2]
-        ctrl    = cv_ctrl + res_ctrl                             # [BN, K, n_ctrl, 2]
-
-        # Bézier decode: C∞-smooth position offsets from current position (no cumsum)
-        traj     = torch.einsum('tc,bkcd->bktd',
-                                self.bezier_basis.to(ctrl.dtype), ctrl)  # [BN, K, T, 2]
-        score    = self.score_head(x).squeeze(-1)                # [BN, K]
-        return traj, score
+        # .clone() → fresh tensor, so the codebook's in-place EMA update (after the
+        # forward, before backward) can't corrupt the autograd-saved query input.
+        anchor_q = self.anchor_mlp(
+            self.codebook.anchors.clone().to(agent_repr.dtype))   # [K, H]
+        mode_e   = base_q + anchor_q                             # [K, H]
+        x     = agent_repr.unsqueeze(1) + mode_e.unsqueeze(0)    # [BN, K, H]
+        disp  = self.mlp(x).view(BN, K, T, 2)                    # [BN, K, T, 2]
+        score = self.score_head(x).squeeze(-1)                   # [BN, K]
+        return disp, score
 
 
 # ── Level-k Interaction Decoder ───────────────────────────────────────────────
@@ -424,7 +361,7 @@ class InteractionDecoder(nn.Module):
     def _refine(self, h_agents, prev_trajs, level_idx, agent_valid=None):
         """
         h_agents:    [B, N, H]
-        prev_trajs:  [B, N, K, T, 2]  — gradient-connected (e2e; Bezier makes this safe)
+        prev_trajs:  [B, N, K, T, 2]  — detached by caller
         agent_valid: [B, N] bool       — mask padding agents from self-attention KV
         Returns:     [B, N, H]
         """
@@ -462,45 +399,39 @@ class InteractionDecoder(nn.Module):
         correction = self.out_projs[level_idx](ca_out)           # [B, N, H]
         return self.out_norms[level_idx](h_agents + correction)
 
-    def forward(self, h_agents, gt_anchor, v_last, h_scn, agent_valid=None):
+    def forward(self, h_agents, gt_anchor, agent_valid=None):
         """
         h_agents:    [B, N, H]
         gt_anchor:   [B, N, 2]
-        v_last:      [B, N, 2]  last observed velocity (CV prior for the decoder)
-        h_scn:       [B, H]     LLM scene-summary hidden (scenario-query guidance)
         agent_valid: [B, N] bool  — propagated to _refine for padding mask
-        Returns:     (all_preds, all_scores)
-                     all_preds:  list of [B, N, K, T, 2] position offsets from current
-                                 position, length = n_levels + 1
-                     all_scores: list of [B, N, K], length = n_levels + 1
+        Returns:     (all_preds_disp, all_scores)
+                     all_preds_disp: list of [B, N, K, T, 2], length = n_levels + 1
+                     all_scores:     list of [B, N, K],        length = n_levels + 1
         """
         B, N, H = h_agents.shape
-        v_flat  = v_last.reshape(B * N, 2)
 
         # Level-0: pure encoder-decoder, no interaction (GameFormer: InitialDecoder)
-        traj_pos, score = self.traj_decoder(h_agents.reshape(B * N, H), v_flat, h_scn)
-        K, T     = traj_pos.shape[1], traj_pos.shape[2]
-        traj_pos = traj_pos.reshape(B, N, K, T, 2)
+        traj_disp, score = self.traj_decoder(h_agents.reshape(B * N, H))
+        K, T      = traj_disp.shape[1], traj_disp.shape[2]
+        traj_disp = traj_disp.reshape(B, N, K, T, 2)
 
         anchor   = gt_anchor.unsqueeze(2).unsqueeze(2)           # [B, N, 1, 1, 2]
-        traj_abs = anchor + traj_pos                             # direct position, no cumsum
+        traj_abs = anchor + traj_disp.cumsum(dim=-2)
 
-        all_preds  = [traj_pos]
-        all_scores = [score.reshape(B, N, K)]
+        all_preds_disp = [traj_disp]
+        all_scores     = [score.reshape(B, N, K)]
 
         h_cur = h_agents
         for level_idx in range(self.n_levels):
-            # E2E: traj_abs and h_cur are NOT detached — gradient flows back through
-            # FutureEncoder (trajectory context) and across levels to the decoder.
-            # Safe with Bezier (no cumsum amplification) and n_levels<=2 (short chain).
-            h_cur = self._refine(h_cur, traj_abs, level_idx, agent_valid)
-            traj_pos_k, score_k = self.traj_decoder(h_cur.reshape(B * N, H), v_flat, h_scn)
-            traj_pos_k = traj_pos_k.reshape(B, N, K, T, 2)
-            traj_abs   = anchor + traj_pos_k
-            all_preds.append(traj_pos_k)
+            h_cur = self._refine(h_cur, traj_abs.detach(), level_idx, agent_valid)
+            traj_disp_k, score_k = self.traj_decoder(h_cur.reshape(B * N, H))
+            traj_disp_k = traj_disp_k.reshape(B, N, K, T, 2)
+            traj_abs = anchor + traj_disp_k.cumsum(dim=-2)
+            all_preds_disp.append(traj_disp_k)
             all_scores.append(score_k.reshape(B, N, K))
+            h_cur = h_cur.detach()
 
-        return all_preds, all_scores
+        return all_preds_disp, all_scores
 
 
 # ── Agent → Lane Cross-Attention ──────────────────────────────────────────────
@@ -549,10 +480,10 @@ class HybridLLMPredictor(nn.Module):
     Hybrid Token LLM Predictor with Level-k Interaction Decoding.
 
     Sequence (inputs_embeds):
-      [text_emb (L_t)] [agent_emb × N] [lane_emb × L] [AGT_token × N] [SCN]
-      └── text via embedding table ──┘  └── numerical projections ──┘ └ learned ┘
+      [text_emb (L_t)] [agent_emb × N] [lane_emb × L] [AGT_token × N]
+      └── text via embedding table ──┘  └── numerical projections ──┘  └── learned ─┘
 
-    AGT position of agent i = L_t + N + L + i;  SCN position = last (L_t + 2N + L)
+    AGT position of agent i = L_t + N + L + i
     """
 
     def __init__(self,
@@ -566,7 +497,6 @@ class HybridLLMPredictor(nn.Module):
                  max_lanes=20,
                  num_modes=6,
                  num_future_steps=60,
-                 n_bezier_ctrl=6,
                  gru_hidden=256,
                  gru_layers=2,
                  use_flash_attn=True,
@@ -615,12 +545,6 @@ class HybridLLMPredictor(nn.Module):
         # Learnable [AGT] summary tokens — one shared embedding expanded per agent
         self.agent_summary_token = nn.Parameter(torch.randn(1, 1, H) * 0.02)
 
-        # Learnable [SCN] scene-summary token, appended LAST in the sequence so it
-        # causally attends to everything (text, agents, lanes, AGT tokens). Its
-        # hidden state h_scn feeds the decoder's scenario queries — the LLM's
-        # scene-level guidance channel (exp12).
-        self.scene_token = nn.Parameter(torch.randn(1, 1, H) * 0.02)
-
         # ResNet-inspired correction projection.
         # agent_emb is fed to the LLM as .detach() (prevents gradient explosion through
         # 28 transformer layers).  The LLM output is treated as a learned "correction"
@@ -636,8 +560,7 @@ class HybridLLMPredictor(nn.Module):
         # ── Decoder (feedforward MLP — no BPTT, see MLPDecoder docstring) ──────
         self.traj_decoder = MLPDecoder(
             hidden_dim=H, num_modes=num_modes,
-            num_future_steps=num_future_steps, mlp_hidden=gru_hidden * 2,
-            n_bezier_ctrl=n_bezier_ctrl)
+            num_future_steps=num_future_steps, mlp_hidden=gru_hidden * 2)
         self.traj_decoder = self.traj_decoder.to(dtype)
 
         # Normalize combined hidden states before decoding
@@ -649,23 +572,6 @@ class HybridLLMPredictor(nn.Module):
         self.interaction = InteractionDecoder(
             traj_decoder=self.traj_decoder, hidden_dim=H,
             cross_attn_dim=128, nhead=4, n_levels=n_levels)
-
-        # Diagnostics (updated each forward, no grad): relative magnitude of the
-        # LLM correction vs the encoder identity path, and of the lane-cross
-        # contribution. These reveal whether the LLM branch is actually doing
-        # anything or is still a near-zero residual (llm_correction_proj is
-        # zero-init, so a ratio that stays tiny means the LLM is a no-op and the
-        # whole prediction is carried by the MLP encoder alone).
-        self.diag_corr_ratio = 0.0
-        self.diag_lane_ratio = 0.0
-        self.diag_scn_ratio  = 0.0   # ‖scene query delta‖/‖base_q‖ (decoder, exp12)
-
-        # Ablation knob: scale applied to llm_correction_proj output before adding
-        # to agent_emb.  1.0 = normal operation.  0.0 = encoder-only (LLM correction
-        # is zeroed out; gradient to LLM/llm_correction_proj is also zero, so LLM
-        # LoRA effectively freezes even without setting llm_lr=0).
-        # Set via train_hybrid.py --llm_correction_scale for diagnostic ablation runs.
-        self.llm_correction_scale = 1.0
 
         if device is not None:
             self.to(device)
@@ -693,12 +599,9 @@ class HybridLLMPredictor(nn.Module):
 
         # Learnable [AGT] summary tokens
         agt_tokens = self.agent_summary_token.expand(B, N, -1)        # [B, N, H]
-        # Learnable [SCN] scene-summary token (last position → attends to all)
-        scn_token  = self.scene_token.expand(B, 1, -1)                # [B, 1, H]
 
-        # Sequence: [text | agent_embs | lane_embs | AGT_tokens | SCN]
-        inputs_embeds = torch.cat(
-            [text_emb, agent_emb, lane_emb, agt_tokens, scn_token], dim=1)
+        # Sequence: [text | agent_embs | lane_embs | AGT_tokens]
+        inputs_embeds = torch.cat([text_emb, agent_emb, lane_emb, agt_tokens], dim=1)
 
         L_total   = inputs_embeds.shape[1]
         attn_mask = torch.ones(B, L_total, device=inputs_embeds.device, dtype=torch.long)
@@ -757,45 +660,26 @@ class HybridLLMPredictor(nn.Module):
 
         # ── ResNet-style residual: identity(encoder) + correction(LLM) ─────────
         h_llm = torch.stack([hidden[:, pos] for pos in agt_pos], dim=1)  # [B, N, H]
-        # [SCN] scene-summary hidden — the LLM's scene-level guidance output,
-        # consumed by the decoder's scenario queries (zero-init scene_proj there).
-        h_scn = hidden[:, -1]                                            # [B, H]
 
         # h_agents = agent_emb (identity)  +  llm_correction_proj(h_llm) (residual correction)
         # Gradient path to AgentEncoder: loss → decoder → agent_emb  (SHORT, no LLM)
         # Gradient path to LLM LoRA:    loss → decoder → h_correction → h_llm → LoRA (long)
         # llm_correction_proj is zero-initialized → LLM contributes 0 at training start,
         # letting the encoder converge first before LLM refinement activates.
-        h_correction = self.llm_correction_proj(h_llm) * self.llm_correction_scale  # [B, N, H]
+        h_correction = self.llm_correction_proj(h_llm)                  # [B, N, H]
         # Norm first, then mask: LayerNorm of a zero vector yields bias (non-zero
         # after training), so masking must happen AFTER norm to keep padding agents at 0.
-        h_pre = self.pre_decoder_norm(agent_emb + h_correction)
+        h_agents = self.pre_decoder_norm(agent_emb + h_correction)
         # Explicit agent→lane cross-attention (uses NON-detached lane_emb so the
         # LaneEncoder receives a direct gradient). Zero-init residual → identity start.
-        h_post = self.lane_cross(h_pre, lane_emb, lane_valid)
-        h_agents = h_post * agent_valid.unsqueeze(-1).float()
-
-        # ── Branch-contribution diagnostics (no grad, valid agents only) ──────
-        # corr_ratio = ‖LLM correction‖ / ‖encoder identity‖  (before pre_norm)
-        # lane_ratio = ‖lane_cross delta‖ / ‖its input‖       (after pre_norm)
-        with torch.no_grad():
-            vm    = agent_valid.unsqueeze(-1).float()
-            enc_n = (agent_emb * vm).norm().clamp(min=1e-6)
-            pre_n = (h_pre     * vm).norm().clamp(min=1e-6)
-            self.diag_corr_ratio = ((h_correction * vm).norm() / enc_n).item()
-            self.diag_lane_ratio = (((h_post - h_pre) * vm).norm() / pre_n).item()
+        h_agents = self.lane_cross(h_agents, lane_emb, lane_valid)
+        h_agents = h_agents * agent_valid.unsqueeze(-1).float()
 
         # ── Level-k interaction decoding ──────────────────────────────────────
-        # v_last: last observed velocity per agent (focal frame) — the decoder's
-        # per-agent CV prior. agent_features layout: [..., 0:2]=pos, [..., 2:4]=vel.
-        v_last = agent_features[:, :, -1, 2:4].to(h_agents.dtype)        # [B, N, 2]
-        v_last = v_last * agent_valid.unsqueeze(-1).to(v_last.dtype)     # zero pad agents
-        all_preds, all_scores = self.interaction(
-            h_agents, gt_anchor, v_last, h_scn, agent_valid)
-        self.diag_scn_ratio = self.traj_decoder.diag_scn_ratio
-        # The codebook is a pure endpoint-distribution diagnostic now (exp12):
-        # the loss only triggers its EMA update; it no longer biases queries or
-        # contributes an anchor-cls term.
+        all_preds, all_scores = self.interaction(h_agents, gt_anchor, agent_valid)
+        # The anchor codebook is shared across levels; returned so the loss can
+        # assign each GT endpoint to its nearest anchor (B2 anchor-cls term) and
+        # drive the online EMA update once per training step.
         return all_preds, all_scores, self.traj_decoder.codebook
 
 

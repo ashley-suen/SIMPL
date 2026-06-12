@@ -84,11 +84,14 @@ def parse_arguments():
     parser.add_argument("--lora_targets", type=str,
                         default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
 
-    # Loss (Bezier: reg_loss is position-space SmoothL1, no cumsum; pos/endpoint
-    #        weights removed — they were displacement-era terms)
-    parser.add_argument("--soft_wta_alpha",    type=float, default=0.1)
+    # Loss (Bezier: reg_loss is position-space SmoothL1, no cumsum; exp12:
+    #        anchor_cls removed, pure scene-WTA by default)
+    parser.add_argument("--soft_wta_alpha",    type=float, default=0.0)
     parser.add_argument("--cls_weight",        type=float, default=0.5)
-    parser.add_argument("--anchor_cls_weight", type=float, default=0.5)
+
+    # Ablation
+    parser.add_argument("--scene_guidance_scale", type=float, default=1.0,
+                        help="0.0 = exp12-A: scenario queries without LLM guidance")
 
     # Optimiser
     parser.add_argument("--llm_lr",           type=float, default=5e-5)
@@ -156,7 +159,7 @@ def main():
     dl_train = DataLoader(train_set, batch_size=args.train_batch_size,
                           shuffle=True, num_workers=args.num_workers,
                           pin_memory=(device.type == "cuda"),
-                          collate_fn=hybrid_collate_fn)
+                          collate_fn=hybrid_collate_fn, drop_last=True)
     dl_val   = DataLoader(val_set,   batch_size=args.val_batch_size,
                           shuffle=False, num_workers=args.num_workers,
                           pin_memory=(device.type == "cuda"),
@@ -175,6 +178,8 @@ def main():
         use_flash_attn=False,       # disabled for local compatibility
         dtype=torch.bfloat16)
     model = model.to(device).to(torch.bfloat16)
+    # exp12-A ablation switch (0.0 = scenario queries without LLM guidance)
+    model.traj_decoder.scene_guidance_scale = args.scene_guidance_scale
 
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
@@ -184,13 +189,12 @@ def main():
     # ── Loss ──────────────────────────────────────────────────────────────────
     loss_fn = HybridMotionLoss(n_levels=args.n_levels, device=device,
                                soft_wta_alpha=args.soft_wta_alpha,
-                               cls_weight=args.cls_weight,
-                               anchor_cls_weight=args.anchor_cls_weight)
+                               cls_weight=args.cls_weight)
     logger.print(f"Loss: HybridMotionLoss n_levels={args.n_levels} | "
                  f"level_weights={loss_fn.level_weights}")
 
     # ── Optimiser ─────────────────────────────────────────────────────────────
-    _slow_keywords = ("llm.",  "llm_correction_proj")
+    _slow_keywords = ("llm.",  "llm_correction_proj", "scene_proj")
     llm_params = [p for n, p in model.named_parameters()
                   if p.requires_grad and any(k in n for k in _slow_keywords)]
     enc_params = [p for n, p in model.named_parameters()
@@ -358,8 +362,10 @@ def main():
         # ── LLM / lane branch contribution (is the LLM actually working?) ─────
         _corr = getattr(model, "diag_corr_ratio", float("nan"))
         _lane = getattr(model, "diag_lane_ratio", float("nan"))
+        _scn  = getattr(model, "diag_scn_ratio",  float("nan"))
         logger.print(f"[Branch] ep {epoch+1} | LLM corr/enc: {_corr:.4f} "
-                     f"| lane_cross/input: {_lane:.4f}")
+                     f"| lane_cross/input: {_lane:.4f} "
+                     f"| scn_q/base_q: {_scn:.4f}")
 
         # ── Anchor codebook diagnostics ──────────────────────────────────────
         cb      = model.traj_decoder.codebook

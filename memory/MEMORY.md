@@ -3,3 +3,4 @@
 - [Experiment launch convention](exp-launch-convention.md) — expN naming, batch/LR, --reset_optimizer on resume, anchor diagnostics
 - [Experiments run on cloud](experiments-run-on-cloud.md) — all training is cloud-side; local is code/debug only; sync before runs
 - [paper/ is reference-only](paper-folder-reference-only.md) — don't traverse paper/ for code work; user will flag when to consult it
+- [SOTA push is primary goal](sota-push-primary-goal.md) — optimize minADE toward SOTA, not ablations; keep LoRA; scene scaling is free (exp13: max_agents/lanes/modes up)

@@ -13,17 +13,19 @@ from simpl.av2_llm_loss import LLMMotionLoss
 
 class HybridMotionLoss(nn.Module):
     def __init__(self, n_levels=2, device="cuda",
-                 soft_wta_alpha=0.0, cls_weight=0.5):
+                 soft_wta_alpha=0.1, endpoint_weight=0.2, cls_weight=0.5,
+                 anchor_cls_weight=0.5):
         """
         n_levels: number of interaction refinement levels (NOT counting level-0).
                   Total prediction outputs = n_levels + 1.
-        exp12: anchor_cls term removed (see LLMMotionLoss docstring).
         """
         super().__init__()
         self.base_loss = LLMMotionLoss(
             device=device,
             soft_wta_alpha=soft_wta_alpha,
+            endpoint_weight=endpoint_weight,
             cls_weight=cls_weight,
+            anchor_cls_weight=anchor_cls_weight,
         )
         # Weights: early levels get half the weight of the final level
         n_total = n_levels + 1
@@ -35,12 +37,13 @@ class HybridMotionLoss(nn.Module):
         """
         all_preds:  list of [B, N, K, T, 2], length = n_levels + 1
         all_scores: list of [B, N, K],        length = n_levels + 1 (or None)
-        codebook:   AnchorCodebook (diagnostic endpoint tracker, or None)
+        codebook:   AnchorCodebook (shared across levels, or None)
         data:       batch dict (same format as LLMMotionLoss expects)
         Returns:    dict with 'loss' (total) + per-level 'loss_l{k}'
 
-        The codebook's online EMA update (diagnostic only) is triggered exactly
-        ONCE per step, on the FINAL level.
+        The codebook's online EMA update is triggered exactly ONCE per step, on the
+        FINAL level — so every level's anchor-cls target uses the same (pre-update)
+        anchors, and the update sees a single set of GT endpoints per batch.
         """
         total_loss = None
         loss_dict  = {}
@@ -51,9 +54,11 @@ class HybridMotionLoss(nn.Module):
             out = self.base_loss(pred, data, scores_k, codebook,
                                  update_codebook=(k == last_k))
             w   = self.level_weights[k]
-            loss_dict[f"loss_l{k}"]     = out["loss"]
-            loss_dict[f"reg_loss_l{k}"] = out["reg_loss"]
-            loss_dict[f"cls_loss_l{k}"] = out["cls_loss"]
+            loss_dict[f"loss_l{k}"]            = out["loss"]
+            loss_dict[f"reg_loss_l{k}"]        = out["reg_loss"]
+            loss_dict[f"ep_loss_l{k}"]         = out["ep_loss"]
+            loss_dict[f"cls_loss_l{k}"]        = out["cls_loss"]
+            loss_dict[f"anchor_cls_loss_l{k}"] = out["anchor_cls_loss"]
             if total_loss is None:
                 total_loss = w * out["loss"]
             else:

@@ -4,27 +4,30 @@ import torch.nn.functional as F
 
 
 class LLMMotionLoss(nn.Module):
-    def __init__(self, device, soft_wta_alpha=0.1,
-                 cls_weight=0.5, anchor_cls_weight=0.5):
+    def __init__(self, device, soft_wta_alpha=0.0, cls_weight=0.5):
         """
-        soft_wta_alpha:    weight for non-winner modes in soft WTA.
-        cls_weight:        weight for the scene-level mode-classification loss.
-                           Supervises the per-mode confidence scores so the K joint
-                           "worlds" can be ranked at inference (needed for brierMinFDE).
-                           Set to 0.0 to disable.
-        anchor_cls_weight: weight for the per-agent ANCHOR classification loss (B2).
-                           Each scored agent's GT endpoint is hard-assigned to its
-                           nearest learnable anchor; the per-mode score head is then
-                           trained (CE) to predict that anchor. This injects the
-                           intention-anchor geometric prior into the modes and is the
-                           multi-modal diversity regulariser. Set to 0.0 to disable.
+        soft_wta_alpha: weight for non-winner modes in soft WTA. Default 0.0
+                        (pure scene-level WTA — exp12): alpha>0 pulls ALL modes
+                        toward every scene's GT, squeezing them toward the
+                        conditional mean and fighting mode diversity. With
+                        scenario queries there is no anchor-cls regulariser, so
+                        the winner-only gradient IS the diversity mechanism.
+        cls_weight:     weight for the scene-level mode-classification loss.
+                        Supervises the per-mode confidence scores so the K joint
+                        "worlds" can be ranked at inference (needed for
+                        brierMinFDE). Set to 0.0 to disable.
+
+        exp12: the per-agent anchor-classification term (B2) is REMOVED — its
+        per-agent anchor semantics conflicted with the scene-shared winner mode
+        of the joint protocol. The AnchorCodebook is kept as a pure diagnostic:
+        this loss still triggers its EMA update so the endpoint-distribution
+        logging keeps working, but anchors no longer affect any loss term.
         """
         super().__init__()
         self.device = device
         self.reg_loss = nn.SmoothL1Loss(reduction="none")
-        self.soft_wta_alpha    = soft_wta_alpha
-        self.cls_weight        = cls_weight
-        self.anchor_cls_weight = anchor_cls_weight
+        self.soft_wta_alpha = soft_wta_alpha
+        self.cls_weight     = cls_weight
 
     def forward(self, predicted_trajs, data, scores=None, codebook=None,
                 update_codebook=False):
@@ -114,42 +117,15 @@ class LLMMotionLoss(nn.Module):
         else:
             cls_loss = reg_loss.new_zeros(())
 
-        # ── B2: per-agent ANCHOR classification + online EMA codebook update ──
-        # Hard-assign each scored agent's GT endpoint to its nearest anchor
-        # (no_grad argmin — MTR-style assignment), then train the per-mode score
-        # head to predict that anchor. This is the diversity regulariser: it forces
-        # every mode/anchor to receive supervision from the agents whose endpoints
-        # fall in its region, rather than collapsing onto one mode. The score head
-        # is shared with the scene-level cls above, so both the joint-ranking signal
-        # and the anchor-geometry signal land on the same logits.
-        #
-        # The anchors themselves are a VQ-VAE-style EMA codebook: once per training
-        # step (update_codebook=True, grad enabled) they are moved toward the mean
-        # of their assigned GT endpoints — online k-means, no offline pass.
-        if scores is not None and codebook is not None and self.anchor_cls_weight > 0.0:
-            anchors = codebook.anchors
+        # ── Endpoint-distribution diagnostic (exp12: no anchor-cls term) ──────
+        # The codebook is a VQ-VAE-style EMA tracker of GT endpoints, kept ONLY
+        # for logging (anchor positions / ema_count / min pairwise sep). Train
+        # only, once per step (update_codebook flag set on the final level).
+        if codebook is not None and update_codebook and torch.is_grad_enabled():
             with torch.no_grad():
-                gt_ep   = gt_last - anchor                                  # [B, N, 2]
-                anc     = anchors.to(gt_ep.dtype).view(1, 1, K, 2)          # [1, 1, K, 2]
-                d2anc   = (gt_ep.unsqueeze(2) - anc).norm(dim=-1)           # [B, N, K]
-                target_mode = d2anc.argmin(dim=-1)                          # [B, N]
-            ce = F.cross_entropy(scores.reshape(B * N, K).float(),
-                                 target_mode.reshape(B * N),
-                                 reduction="none")                          # [B*N]
-            ce = ce * train_mask.reshape(B * N).float()
-            anchor_cls_loss = ce.sum() / num_train_agents
+                gt_ep = gt_last - anchor                                    # [B, N, 2]
+                codebook.ema_update(gt_ep[train_mask.bool()])
 
-            # Online EMA update — train only (skipped under torch.no_grad in val),
-            # once per step (update_codebook flag set on the final level).
-            if update_codebook and torch.is_grad_enabled():
-                ep_scored = gt_ep[train_mask.bool()]                        # [M, 2]
-                codebook.ema_update(ep_scored)
-        else:
-            anchor_cls_loss = reg_loss.new_zeros(())
+        total_loss = reg_loss + self.cls_weight * cls_loss
 
-        total_loss = (reg_loss
-                      + self.cls_weight        * cls_loss
-                      + self.anchor_cls_weight * anchor_cls_loss)
-
-        return {"loss": total_loss, "reg_loss": reg_loss,
-                "cls_loss": cls_loss, "anchor_cls_loss": anchor_cls_loss}
+        return {"loss": total_loss, "reg_loss": reg_loss, "cls_loss": cls_loss}

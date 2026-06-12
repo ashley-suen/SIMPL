@@ -1,0 +1,400 @@
+2026-06-11 09:24:32:[Logger] 20260611-212432 - logger enable_flags: {'writer': True}
+2026-06-11 09:24:32:[Logger] Log file: /root/code/SIMPL/log/log_20260611-212432.log
+2026-06-11 09:24:32:DDP backend=gloo | world_size=4 | rank=0
+2026-06-11 09:24:32:Args: Namespace(features_dir='data_av2/feature', ckpt_dir='saved_models/exp12b_scenario_joint', exp_name='exp12b_scenario_joint', max_text_len=600, max_agents=6, max_lanes=20, train_batch_size=56, val_batch_size=56, train_epoches=40, val_interval=1, seed=42, num_workers=8, max_train_samples=0, logger_writer=True, no_pbar=False, model_name='Qwen/Qwen3-0.6B-Base', num_modes=6, n_bezier_ctrl=6, n_levels=2, lora_r=32, lora_alpha=64, lora_dropout=0.05, lora_targets='all-linear', soft_wta_alpha=0.0, cls_weight=0.5, llm_correction_scale=1.0, scene_guidance_scale=1.0, llm_lr=5e-05, gru_lr=0.0001, grad_clip=5.0, llm_grad_clip=1.0, grad_accum_steps=1, scheduler='cosine_warmup_restart', T_0=40, T_mult=1, warmup_epochs=5, eta_min_ratio=0.1, print_interval=100, running_window=50, save_last_every_epoch=True, resume_from='', resume_epoch=0, reset_optimizer=False, flash_attn=True, compile=False, compile_mode='default', dist_backend='gloo', early_stop_patience=5, early_stop_min_delta=0.001)
+
+2026-06-11 09:24:32:Project Path: /root/code/SIMPL
+2026-06-11 09:24:32:Datetime: 20260611-212432
+
+2026-06-11 09:24:32:Commit Msg: commit 2a33314c92f42feee2b1b1b863f394672cd23eca
+Author: lu.zhang <louiszhang5@gmail.com>
+Date:   Wed Jun 19 00:53:23 2024 +0800
+
+    [Fix] update ckpt for av2
+
+2026-06-11 09:24:32:======================================
+
+2026-06-11 09:24:44:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:24:44:Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+2026-06-11 09:24:44:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:24:44:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/tokenizer_config.json "HTTP/1.1 200 OK"
+2026-06-11 09:24:44:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:24:44:Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+2026-06-11 09:24:45:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/tokenizer_config.json "HTTP/1.1 200 OK"
+2026-06-11 09:24:45:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/tokenizer_config.json "HTTP/1.1 200 OK"
+2026-06-11 09:24:45:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:24:45:Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+2026-06-11 09:24:46:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/tokenizer_config.json "HTTP/1.1 200 OK"
+2026-06-11 09:24:47:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+2026-06-11 09:24:47:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-06-11 09:24:47:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base "HTTP/1.1 200 OK"
+2026-06-11 09:24:48:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:24:48:Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+2026-06-11 09:24:48:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/config.json "HTTP/1.1 200 OK"
+2026-06-11 09:24:51:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+2026-06-11 09:24:51:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-06-11 09:24:51:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base "HTTP/1.1 200 OK"
+2026-06-11 09:24:52:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:24:52:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/config.json "HTTP/1.1 200 OK"
+2026-06-11 09:24:53:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+2026-06-11 09:24:53:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-06-11 09:24:53:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base "HTTP/1.1 200 OK"
+2026-06-11 09:24:53:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+2026-06-11 09:24:53:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-06-11 09:24:54:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base "HTTP/1.1 200 OK"
+2026-06-11 09:24:54:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:24:54:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:24:54:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/config.json "HTTP/1.1 200 OK"
+2026-06-11 09:24:54:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:24:54:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/tokenizer_config.json "HTTP/1.1 200 OK"
+2026-06-11 09:24:54:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/config.json "HTTP/1.1 200 OK"
+2026-06-11 09:24:59:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:24:59:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/tokenizer_config.json "HTTP/1.1 200 OK"
+2026-06-11 09:25:00:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+2026-06-11 09:25:00:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-06-11 09:25:00:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:25:00:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base "HTTP/1.1 200 OK"
+2026-06-11 09:25:00:Train: 199908 | Val: 24988 | max_text_len=600 | max_agents=6 | max_lanes=20
+2026-06-11 09:25:00:GPU: NVIDIA RTX PRO 6000 Blackwell Server Edition SM=120 | flash_attn_compat=True
+2026-06-11 09:25:00:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/tokenizer_config.json "HTTP/1.1 200 OK"
+2026-06-11 09:25:01:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:25:01:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/config.json "HTTP/1.1 200 OK"
+2026-06-11 09:25:01:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:25:01:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/tokenizer_config.json "HTTP/1.1 200 OK"
+2026-06-11 09:25:02:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+2026-06-11 09:25:02:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-06-11 09:25:02:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base "HTTP/1.1 200 OK"
+2026-06-11 09:25:03:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+2026-06-11 09:25:03:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-06-11 09:25:04:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base "HTTP/1.1 200 OK"
+2026-06-11 09:25:09:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:25:09:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/config.json "HTTP/1.1 200 OK"
+2026-06-11 09:25:17:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:25:17:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/config.json "HTTP/1.1 200 OK"
+2026-06-11 09:25:21:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 503 Service Unavailable"
+2026-06-11 09:25:24:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-06-11 09:25:24:HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B-Base "HTTP/1.1 200 OK"
+2026-06-11 09:25:25:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:25:25:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:25:26:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:25:26:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/config.json "HTTP/1.1 200 OK"
+2026-06-11 09:25:26:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/config.json "HTTP/1.1 200 OK"
+2026-06-11 09:25:26:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/config.json "HTTP/1.1 200 OK"
+2026-06-11 09:25:27:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:25:28:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/config.json "HTTP/1.1 200 OK"
+2026-06-11 09:25:29:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:25:30:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/config.json "HTTP/1.1 200 OK"
+2026-06-11 09:25:35:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:25:36:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/config.json "HTTP/1.1 200 OK"
+2026-06-11 09:25:36:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:25:36:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/config.json "HTTP/1.1 200 OK"
+2026-06-11 09:25:37:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:25:37:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/config.json "HTTP/1.1 200 OK"
+2026-06-11 09:25:39:HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-11 09:25:39:HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B-Base/da87bfb608c14b7cf20ba1ce41287e8de496c0cd/config.json "HTTP/1.1 200 OK"
+2026-06-11 09:25:41:Params: trainable=30,803,533 / total=626,853,453 (4.91%)
+2026-06-11 09:25:41:Loss: Level-k HybridMotionLoss | n_levels=2 | weights=[0.25, 0.25, 0.5]
+2026-06-11 09:25:41:[Ablation] llm_correction_scale=1.0 (normal LLM path)
+2026-06-11 09:25:41:[Ablation] scene_guidance_scale=1.0 (LLM scenario guidance ON)
+2026-06-11 09:25:41:Optimiser: llm_params=27,532,288 | enc+dec_params=3,271,245
+2026-06-11 09:25:41:Scheduler: CosineWarmupRestart T_0=40 warmup=5 eta_min=0.1
+2026-06-11 09:25:41:
+================================================================================
+2026-06-11 09:25:41:Epoch 1/40
+2026-06-11 09:25:41:  - LR              : llm_lr=5.00e-06, enc+dec_lr=1.00e-05
+2026-06-11 09:25:41:  - Batch (GPU/eff) : 56 / 224
+2026-06-11 09:25:41:  - LoRA r/α        : 32/64
+2026-06-11 09:25:41:  - Level-k          : 2
+2026-06-11 09:25:41:  - Agents/Lanes     : 6/20
+2026-06-11 09:25:41:================================================================================
+2026-06-11 09:28:16:  [ep 1 | 100/892] loss=3.0821 (avg=3.4181) | loss_l0=3.1000 | reg_loss_l0=2.3581 | cls_loss_l0=1.4838 | loss_l1=3.0506 | reg_loss_l1=2.3232 | cls_loss_l1=1.4549 | loss_l2=3.0890 | reg_loss_l2=2.3382 | cls_loss_l2=1.5015 | gn_enc=2.22 gn_llm=3.00 | 0.65 it/s | eta=20.4min | mem=1391MB
+2026-06-11 09:30:48:  [ep 1 | 200/892] loss=2.8737 (avg=3.3126) | loss_l0=2.8937 | reg_loss_l0=2.1561 | cls_loss_l0=1.4751 | loss_l1=2.8572 | reg_loss_l1=2.1345 | cls_loss_l1=1.4454 | loss_l2=2.8720 | reg_loss_l2=2.1405 | cls_loss_l2=1.4630 | gn_enc=2.22 gn_llm=3.56 | 0.65 it/s | eta=17.7min | mem=1391MB
+2026-06-11 09:33:21:  [ep 1 | 300/892] loss=2.8998 (avg=3.2439) | loss_l0=2.9033 | reg_loss_l0=2.3330 | cls_loss_l0=1.1407 | loss_l1=2.9105 | reg_loss_l1=2.3222 | cls_loss_l1=1.1765 | loss_l2=2.8927 | reg_loss_l2=2.3078 | cls_loss_l2=1.1698 | gn_enc=2.45 gn_llm=4.56 | 0.65 it/s | eta=15.1min | mem=1391MB
+2026-06-11 09:35:53:  [ep 1 | 400/892] loss=3.4463 (avg=3.1705) | loss_l0=3.4353 | reg_loss_l0=2.8368 | cls_loss_l0=1.1971 | loss_l1=3.4435 | reg_loss_l1=2.8338 | cls_loss_l1=1.2194 | loss_l2=3.4532 | reg_loss_l2=2.8274 | cls_loss_l2=1.2515 | gn_enc=2.38 gn_llm=3.73 | 0.65 it/s | eta=12.6min | mem=1391MB
+2026-06-11 09:38:26:  [ep 1 | 500/892] loss=3.2408 (avg=3.0706) | loss_l0=3.2516 | reg_loss_l0=2.5244 | cls_loss_l0=1.4544 | loss_l1=3.2419 | reg_loss_l1=2.5134 | cls_loss_l1=1.4570 | loss_l2=3.2348 | reg_loss_l2=2.5055 | cls_loss_l2=1.4586 | gn_enc=4.91 gn_llm=4.25 | 0.65 it/s | eta=10.0min | mem=1391MB
+2026-06-11 09:40:59:  [ep 1 | 600/892] loss=3.2991 (avg=3.1397) | loss_l0=3.3266 | reg_loss_l0=2.7674 | cls_loss_l0=1.1185 | loss_l1=3.2828 | reg_loss_l1=2.7500 | cls_loss_l1=1.0656 | loss_l2=3.2934 | reg_loss_l2=2.7165 | cls_loss_l2=1.1538 | gn_enc=2.59 gn_llm=4.66 | 0.65 it/s | eta=7.4min | mem=1391MB
+2026-06-11 09:43:31:  [ep 1 | 700/892] loss=3.6517 (avg=3.0861) | loss_l0=3.6543 | reg_loss_l0=3.0048 | cls_loss_l0=1.2991 | loss_l1=3.6507 | reg_loss_l1=2.9980 | cls_loss_l1=1.3054 | loss_l2=3.6509 | reg_loss_l2=2.9903 | cls_loss_l2=1.3211 | gn_enc=3.03 gn_llm=5.91 | 0.65 it/s | eta=4.9min | mem=1391MB
+2026-06-11 09:46:03:  [ep 1 | 800/892] loss=3.3621 (avg=3.0859) | loss_l0=3.3773 | reg_loss_l0=2.6411 | cls_loss_l0=1.4724 | loss_l1=3.3559 | reg_loss_l1=2.6399 | cls_loss_l1=1.4319 | loss_l2=3.3575 | reg_loss_l2=2.6347 | cls_loss_l2=1.4456 | gn_enc=2.00 gn_llm=3.55 | 0.65 it/s | eta=2.3min | mem=1391MB
+2026-06-11 09:48:23:  [ep 1 | 892/892] loss=3.2187 (avg=3.0439) | loss_l0=3.2069 | reg_loss_l0=2.4793 | cls_loss_l0=1.4553 | loss_l1=3.2580 | reg_loss_l1=2.4765 | cls_loss_l1=1.5629 | loss_l2=3.2050 | reg_loss_l2=2.4668 | cls_loss_l2=1.4764 | gn_enc=2.89 gn_llm=4.81 | 0.65 it/s | eta=0.0min | mem=1391MB
+2026-06-11 09:48:23:[Train] ep 1 avg_loss=3.2139 | time=22.71min | peak_mem=84800MB
+2026-06-11 09:48:25:  >> Saved saved_models/exp12b_scenario_joint/exp12b_scenario_joint_20260611-212432_hybrid_last.tar (1328.6 MB)
+2026-06-11 09:49:25:[Validation] ep 1 | loss: 3.0459 | minADE: 2.7108 m | minFDE: 6.9319 m | brierMinFDE: 7.4001 | time: 1.003 mins
+2026-06-11 09:49:25:[Branch] ep 1 | LLM corr/enc: 0.5573 | lane_cross/input: 0.0218 | scn_q/base_q: 141.0505
+2026-06-11 09:49:25:[Modes] ep 1 | oracle-winner usage: m0:8.0% m1:16.6% m2:35.1% m3:10.7% m4:12.3% m5:17.2%
+2026-06-11 09:49:25:[Anchors] ep 1 | min pairwise sep: 25.208 m
+2026-06-11 09:49:25:    anchor[0] = ( +81.50,   -0.39) | ema_count =    39.75
+2026-06-11 09:49:25:    anchor[1] = (  +3.12,   +0.01) | ema_count =   197.00
+2026-06-11 09:49:25:    anchor[2] = ( +23.25,  +24.00) | ema_count =    13.25
+2026-06-11 09:49:25:    anchor[3] = ( +56.25,   -0.16) | ema_count =    69.00
+2026-06-11 09:49:25:    anchor[4] = ( +30.62,   -0.10) | ema_count =    70.50
+2026-06-11 09:49:25:    anchor[5] = ( +20.88,  -23.75) | ema_count =    11.12
+2026-06-11 09:49:25:  >> minADE improved by inf m → 2.7108 m; saving best checkpoint...
+2026-06-11 09:49:27:  >> Saved saved_models/exp12b_scenario_joint/exp12b_scenario_joint_20260611-212432_hybrid_best.tar (1328.6 MB)
+2026-06-11 09:49:27:
+================================================================================
+2026-06-11 09:49:27:Epoch 2/40
+2026-06-11 09:49:27:  - LR              : llm_lr=1.40e-05, enc+dec_lr=2.80e-05
+2026-06-11 09:49:27:  - Batch (GPU/eff) : 56 / 224
+2026-06-11 09:49:27:  - LoRA r/α        : 32/64
+2026-06-11 09:49:27:  - Level-k          : 2
+2026-06-11 09:49:27:  - Agents/Lanes     : 6/20
+2026-06-11 09:49:27:================================================================================
+2026-06-11 09:52:02:  [ep 2 | 100/892] loss=3.0649 (avg=2.9965) | loss_l0=3.0752 | reg_loss_l0=2.3761 | cls_loss_l0=1.3983 | loss_l1=3.0625 | reg_loss_l1=2.3601 | cls_loss_l1=1.4049 | loss_l2=3.0608 | reg_loss_l2=2.3577 | cls_loss_l2=1.4062 | gn_enc=3.55 gn_llm=4.78 | 0.65 it/s | eta=20.3min | mem=1392MB
+2026-06-11 09:54:34:  [ep 2 | 200/892] loss=3.2355 (avg=3.0047) | loss_l0=3.2708 | reg_loss_l0=2.7077 | cls_loss_l0=1.1263 | loss_l1=3.2368 | reg_loss_l1=2.6709 | cls_loss_l1=1.1319 | loss_l2=3.2172 | reg_loss_l2=2.6651 | cls_loss_l2=1.1042 | gn_enc=2.30 gn_llm=4.84 | 0.65 it/s | eta=17.7min | mem=1392MB
+2026-06-11 09:57:07:  [ep 2 | 300/892] loss=2.8962 (avg=2.9136) | loss_l0=2.8842 | reg_loss_l0=2.2273 | cls_loss_l0=1.3139 | loss_l1=2.9043 | reg_loss_l1=2.2280 | cls_loss_l1=1.3525 | loss_l2=2.8982 | reg_loss_l2=2.2195 | cls_loss_l2=1.3574 | gn_enc=2.69 gn_llm=5.06 | 0.65 it/s | eta=15.1min | mem=1392MB
+2026-06-11 09:59:39:  [ep 2 | 400/892] loss=2.3372 (avg=2.8586) | loss_l0=2.3511 | reg_loss_l0=1.7086 | cls_loss_l0=1.2851 | loss_l1=2.3461 | reg_loss_l1=1.7173 | cls_loss_l1=1.2576 | loss_l2=2.3257 | reg_loss_l2=1.7075 | cls_loss_l2=1.2365 | gn_enc=2.06 gn_llm=4.19 | 0.65 it/s | eta=12.5min | mem=1392MB
+2026-06-11 10:02:12:  [ep 2 | 500/892] loss=3.5256 (avg=2.9801) | loss_l0=3.5393 | reg_loss_l0=2.8101 | cls_loss_l0=1.4585 | loss_l1=3.5124 | reg_loss_l1=2.7861 | cls_loss_l1=1.4527 | loss_l2=3.5254 | reg_loss_l2=2.8028 | cls_loss_l2=1.4452 | gn_enc=2.67 gn_llm=5.47 | 0.65 it/s | eta=10.0min | mem=1392MB
+2026-06-11 10:04:45:  [ep 2 | 600/892] loss=3.1711 (avg=2.8702) | loss_l0=3.1885 | reg_loss_l0=2.4386 | cls_loss_l0=1.4997 | loss_l1=3.1657 | reg_loss_l1=2.4132 | cls_loss_l1=1.5050 | loss_l2=3.1651 | reg_loss_l2=2.4022 | cls_loss_l2=1.5257 | gn_enc=2.34 gn_llm=4.62 | 0.65 it/s | eta=7.4min | mem=1392MB
+2026-06-11 10:07:17:  [ep 2 | 700/892] loss=3.2802 (avg=2.8620) | loss_l0=3.2821 | reg_loss_l0=2.5285 | cls_loss_l0=1.5072 | loss_l1=3.2684 | reg_loss_l1=2.5147 | cls_loss_l1=1.5074 | loss_l2=3.2851 | reg_loss_l2=2.5311 | cls_loss_l2=1.5081 | gn_enc=2.83 gn_llm=5.69 | 0.65 it/s | eta=4.9min | mem=1392MB
+2026-06-11 10:09:50:  [ep 2 | 800/892] loss=3.7905 (avg=2.8749) | loss_l0=3.8068 | reg_loss_l0=3.0780 | cls_loss_l0=1.4576 | loss_l1=3.7489 | reg_loss_l1=3.0303 | cls_loss_l1=1.4372 | loss_l2=3.8031 | reg_loss_l2=3.0513 | cls_loss_l2=1.5035 | gn_enc=3.06 gn_llm=5.75 | 0.65 it/s | eta=2.3min | mem=1392MB
+2026-06-11 10:12:10:  [ep 2 | 892/892] loss=2.6992 (avg=2.8470) | loss_l0=2.7272 | reg_loss_l0=2.1213 | cls_loss_l0=1.2117 | loss_l1=2.6874 | reg_loss_l1=2.1131 | cls_loss_l1=1.1487 | loss_l2=2.6912 | reg_loss_l2=2.0965 | cls_loss_l2=1.1893 | gn_enc=2.78 gn_llm=5.81 | 0.65 it/s | eta=0.0min | mem=1392MB
+2026-06-11 10:12:10:[Train] ep 2 avg_loss=2.9278 | time=22.70min | peak_mem=84844MB
+2026-06-11 10:12:20:  >> Saved saved_models/exp12b_scenario_joint/exp12b_scenario_joint_20260611-212432_hybrid_last.tar (1328.6 MB)
+2026-06-11 10:13:17:[Validation] ep 2 | loss: 2.8498 | minADE: 2.4966 m | minFDE: 6.4746 m | brierMinFDE: 6.9649 | time: 0.955 mins
+2026-06-11 10:13:17:[Branch] ep 2 | LLM corr/enc: 0.6942 | lane_cross/input: 0.0415 | scn_q/base_q: 163.1259
+2026-06-11 10:13:17:[Modes] ep 2 | oracle-winner usage: m0:23.6% m1:11.4% m2:34.6% m3:7.6% m4:11.0% m5:11.7%
+2026-06-11 10:13:17:[Anchors] ep 2 | min pairwise sep: 24.195 m
+2026-06-11 10:13:17:    anchor[0] = ( +85.50,   -0.43) | ema_count =    35.25
+2026-06-11 10:13:17:    anchor[1] = (  +3.17,   +0.00) | ema_count =   203.00
+2026-06-11 10:13:17:    anchor[2] = ( +23.38,  +24.25) | ema_count =    13.50
+2026-06-11 10:13:17:    anchor[3] = ( +57.25,   -0.22) | ema_count =    70.50
+2026-06-11 10:13:17:    anchor[4] = ( +29.88,   -0.12) | ema_count =    76.50
+2026-06-11 10:13:17:    anchor[5] = ( +21.00,  -22.62) | ema_count =    11.94
+2026-06-11 10:13:17:  >> minADE improved by 0.2141 m → 2.4966 m; saving best checkpoint...
+2026-06-11 10:13:28:  >> Saved saved_models/exp12b_scenario_joint/exp12b_scenario_joint_20260611-212432_hybrid_best.tar (1328.6 MB)
+2026-06-11 10:13:28:
+================================================================================
+2026-06-11 10:13:28:Epoch 3/40
+2026-06-11 10:13:28:  - LR              : llm_lr=2.30e-05, enc+dec_lr=4.60e-05
+2026-06-11 10:13:28:  - Batch (GPU/eff) : 56 / 224
+2026-06-11 10:13:28:  - LoRA r/α        : 32/64
+2026-06-11 10:13:28:  - Level-k          : 2
+2026-06-11 10:13:28:  - Agents/Lanes     : 6/20
+2026-06-11 10:13:28:================================================================================
+2026-06-11 10:16:03:  [ep 3 | 100/892] loss=2.5382 (avg=2.8884) | loss_l0=2.5540 | reg_loss_l0=1.8056 | cls_loss_l0=1.4968 | loss_l1=2.5202 | reg_loss_l1=1.7833 | cls_loss_l1=1.4740 | loss_l2=2.5394 | reg_loss_l2=1.7727 | cls_loss_l2=1.5333 | gn_enc=2.58 gn_llm=4.12 | 0.65 it/s | eta=20.3min | mem=1392MB
+2026-06-11 10:18:35:  [ep 3 | 200/892] loss=2.4838 (avg=2.8095) | loss_l0=2.5093 | reg_loss_l0=1.8511 | cls_loss_l0=1.3164 | loss_l1=2.4798 | reg_loss_l1=1.8252 | cls_loss_l1=1.3092 | loss_l2=2.4731 | reg_loss_l2=1.8154 | cls_loss_l2=1.3153 | gn_enc=3.17 gn_llm=5.94 | 0.65 it/s | eta=17.7min | mem=1392MB
+2026-06-11 10:21:08:  [ep 3 | 300/892] loss=2.5823 (avg=2.9573) | loss_l0=2.5956 | reg_loss_l0=1.9347 | cls_loss_l0=1.3217 | loss_l1=2.5632 | reg_loss_l1=1.9016 | cls_loss_l1=1.3233 | loss_l2=2.5851 | reg_loss_l2=1.9398 | cls_loss_l2=1.2908 | gn_enc=2.19 gn_llm=4.06 | 0.65 it/s | eta=15.1min | mem=1392MB
+2026-06-11 10:23:41:  [ep 3 | 400/892] loss=3.0969 (avg=2.7309) | loss_l0=3.1681 | reg_loss_l0=2.4198 | cls_loss_l0=1.4965 | loss_l1=3.0866 | reg_loss_l1=2.3534 | cls_loss_l1=1.4664 | loss_l2=3.0664 | reg_loss_l2=2.3308 | cls_loss_l2=1.4711 | gn_enc=1.80 gn_llm=4.19 | 0.65 it/s | eta=12.6min | mem=1392MB
+2026-06-11 10:26:14:  [ep 3 | 500/892] loss=3.0140 (avg=2.8405) | loss_l0=3.0359 | reg_loss_l0=2.3553 | cls_loss_l0=1.3612 | loss_l1=3.0145 | reg_loss_l1=2.3193 | cls_loss_l1=1.3904 | loss_l2=3.0029 | reg_loss_l2=2.3241 | cls_loss_l2=1.3576 | gn_enc=1.84 gn_llm=3.77 | 0.65 it/s | eta=10.0min | mem=1392MB
+2026-06-11 10:28:47:  [ep 3 | 600/892] loss=2.9073 (avg=2.6473) | loss_l0=2.9334 | reg_loss_l0=2.2192 | cls_loss_l0=1.4284 | loss_l1=2.9214 | reg_loss_l1=2.2193 | cls_loss_l1=1.4041 | loss_l2=2.8873 | reg_loss_l2=2.1966 | cls_loss_l2=1.3813 | gn_enc=1.98 gn_llm=3.94 | 0.65 it/s | eta=7.4min | mem=1392MB
+2026-06-11 10:31:19:  [ep 3 | 700/892] loss=2.9372 (avg=2.7510) | loss_l0=2.9564 | reg_loss_l0=2.2789 | cls_loss_l0=1.3550 | loss_l1=2.9556 | reg_loss_l1=2.2924 | cls_loss_l1=1.3263 | loss_l2=2.9185 | reg_loss_l2=2.2534 | cls_loss_l2=1.3303 | gn_enc=2.14 gn_llm=4.28 | 0.65 it/s | eta=4.9min | mem=1392MB
+2026-06-11 10:33:52:  [ep 3 | 800/892] loss=2.4826 (avg=2.6455) | loss_l0=2.4970 | reg_loss_l0=1.7731 | cls_loss_l0=1.4478 | loss_l1=2.5129 | reg_loss_l1=1.7698 | cls_loss_l1=1.4861 | loss_l2=2.4603 | reg_loss_l2=1.7359 | cls_loss_l2=1.4488 | gn_enc=2.14 gn_llm=3.73 | 0.65 it/s | eta=2.3min | mem=1392MB
+2026-06-11 10:36:12:  [ep 3 | 892/892] loss=2.9701 (avg=2.6952) | loss_l0=3.0375 | reg_loss_l0=2.4736 | cls_loss_l0=1.1279 | loss_l1=2.9412 | reg_loss_l1=2.3751 | cls_loss_l1=1.1320 | loss_l2=2.9508 | reg_loss_l2=2.3831 | cls_loss_l2=1.1354 | gn_enc=2.17 gn_llm=4.22 | 0.65 it/s | eta=0.0min | mem=1392MB
+2026-06-11 10:36:12:[Train] ep 3 avg_loss=2.7746 | time=22.71min | peak_mem=84790MB
+2026-06-11 10:36:22:  >> Saved saved_models/exp12b_scenario_joint/exp12b_scenario_joint_20260611-212432_hybrid_last.tar (1328.6 MB)
+2026-06-11 10:37:19:[Validation] ep 3 | loss: 2.6956 | minADE: 2.3275 m | minFDE: 6.0737 m | brierMinFDE: 6.5518 | time: 0.956 mins
+2026-06-11 10:37:19:[Branch] ep 3 | LLM corr/enc: 0.7828 | lane_cross/input: 0.0501 | scn_q/base_q: 172.2578
+2026-06-11 10:37:19:[Modes] ep 3 | oracle-winner usage: m0:22.3% m1:10.8% m2:35.1% m3:8.4% m4:11.0% m5:12.5%
+2026-06-11 10:37:19:[Anchors] ep 3 | min pairwise sep: 24.930 m
+2026-06-11 10:37:19:    anchor[0] = ( +85.50,   -0.39) | ema_count =    33.50
+2026-06-11 10:37:19:    anchor[1] = (  +3.09,   -0.02) | ema_count =   204.00
+2026-06-11 10:37:19:    anchor[2] = ( +23.12,  +24.00) | ema_count =    13.69
+2026-06-11 10:37:19:    anchor[3] = ( +57.25,   -0.21) | ema_count =    71.00
+2026-06-11 10:37:19:    anchor[4] = ( +30.00,   -0.08) | ema_count =    77.50
+2026-06-11 10:37:19:    anchor[5] = ( +21.12,  -23.38) | ema_count =    11.12
+2026-06-11 10:37:19:  >> minADE improved by 0.1692 m → 2.3275 m; saving best checkpoint...
+2026-06-11 10:37:29:  >> Saved saved_models/exp12b_scenario_joint/exp12b_scenario_joint_20260611-212432_hybrid_best.tar (1328.6 MB)
+2026-06-11 10:37:29:
+================================================================================
+2026-06-11 10:37:29:Epoch 4/40
+2026-06-11 10:37:29:  - LR              : llm_lr=3.20e-05, enc+dec_lr=6.40e-05
+2026-06-11 10:37:29:  - Batch (GPU/eff) : 56 / 224
+2026-06-11 10:37:29:  - LoRA r/α        : 32/64
+2026-06-11 10:37:29:  - Level-k          : 2
+2026-06-11 10:37:29:  - Agents/Lanes     : 6/20
+2026-06-11 10:37:29:================================================================================
+2026-06-11 10:40:05:  [ep 4 | 100/892] loss=2.2642 (avg=2.6544) | loss_l0=2.2817 | reg_loss_l0=1.5958 | cls_loss_l0=1.3718 | loss_l1=2.2706 | reg_loss_l1=1.5836 | cls_loss_l1=1.3741 | loss_l2=2.2522 | reg_loss_l2=1.5784 | cls_loss_l2=1.3475 | gn_enc=2.34 gn_llm=4.22 | 0.65 it/s | eta=20.3min | mem=1392MB
+2026-06-11 10:42:38:  [ep 4 | 200/892] loss=2.4250 (avg=2.6287) | loss_l0=2.4820 | reg_loss_l0=1.8378 | cls_loss_l0=1.2883 | loss_l1=2.4156 | reg_loss_l1=1.7993 | cls_loss_l1=1.2327 | loss_l2=2.4011 | reg_loss_l2=1.7974 | cls_loss_l2=1.2075 | gn_enc=1.90 gn_llm=3.48 | 0.65 it/s | eta=17.7min | mem=1392MB
+2026-06-11 10:45:11:  [ep 4 | 300/892] loss=2.6234 (avg=2.6507) | loss_l0=2.6108 | reg_loss_l0=1.9329 | cls_loss_l0=1.3559 | loss_l1=2.6234 | reg_loss_l1=1.9473 | cls_loss_l1=1.3521 | loss_l2=2.6297 | reg_loss_l2=1.9659 | cls_loss_l2=1.3276 | gn_enc=2.45 gn_llm=4.69 | 0.65 it/s | eta=15.1min | mem=1392MB
+2026-06-11 10:47:44:  [ep 4 | 400/892] loss=2.7628 (avg=2.6354) | loss_l0=2.7518 | reg_loss_l0=2.0789 | cls_loss_l0=1.3458 | loss_l1=2.7884 | reg_loss_l1=2.1039 | cls_loss_l1=1.3689 | loss_l2=2.7556 | reg_loss_l2=2.0877 | cls_loss_l2=1.3357 | gn_enc=2.67 gn_llm=4.41 | 0.65 it/s | eta=12.6min | mem=1392MB
+2026-06-11 10:50:17:  [ep 4 | 500/892] loss=2.5454 (avg=2.6846) | loss_l0=2.5724 | reg_loss_l0=1.7807 | cls_loss_l0=1.5834 | loss_l1=2.5459 | reg_loss_l1=1.7550 | cls_loss_l1=1.5819 | loss_l2=2.5317 | reg_loss_l2=1.7450 | cls_loss_l2=1.5734 | gn_enc=1.79 gn_llm=4.38 | 0.65 it/s | eta=10.0min | mem=1392MB
+2026-06-11 10:52:50:  [ep 4 | 600/892] loss=3.0669 (avg=2.7048) | loss_l0=3.0745 | reg_loss_l0=2.4561 | cls_loss_l0=1.2369 | loss_l1=3.0245 | reg_loss_l1=2.4135 | cls_loss_l1=1.2219 | loss_l2=3.0843 | reg_loss_l2=2.4400 | cls_loss_l2=1.2886 | gn_enc=2.27 gn_llm=4.00 | 0.65 it/s | eta=7.5min | mem=1392MB
+2026-06-11 10:55:23:  [ep 4 | 700/892] loss=2.0181 (avg=2.6598) | loss_l0=2.0505 | reg_loss_l0=1.4352 | cls_loss_l0=1.2306 | loss_l1=2.0492 | reg_loss_l1=1.4138 | cls_loss_l1=1.2708 | loss_l2=1.9863 | reg_loss_l2=1.3695 | cls_loss_l2=1.2336 | gn_enc=1.73 gn_llm=4.19 | 0.65 it/s | eta=4.9min | mem=1392MB
+2026-06-11 10:57:56:  [ep 4 | 800/892] loss=2.5275 (avg=2.7330) | loss_l0=2.5408 | reg_loss_l0=1.8971 | cls_loss_l0=1.2873 | loss_l1=2.4990 | reg_loss_l1=1.8226 | cls_loss_l1=1.3528 | loss_l2=2.5351 | reg_loss_l2=1.8609 | cls_loss_l2=1.3485 | gn_enc=2.25 gn_llm=4.34 | 0.65 it/s | eta=2.3min | mem=1392MB
+2026-06-11 11:00:17:  [ep 4 | 892/892] loss=2.3148 (avg=2.6246) | loss_l0=2.3605 | reg_loss_l0=1.6636 | cls_loss_l0=1.3938 | loss_l1=2.2940 | reg_loss_l1=1.5983 | cls_loss_l1=1.3914 | loss_l2=2.3022 | reg_loss_l2=1.5881 | cls_loss_l2=1.4283 | gn_enc=1.73 gn_llm=2.88 | 0.65 it/s | eta=0.0min | mem=1392MB
+2026-06-11 11:00:17:[Train] ep 4 avg_loss=2.6568 | time=22.77min | peak_mem=84839MB
+2026-06-11 11:00:27:  >> Saved saved_models/exp12b_scenario_joint/exp12b_scenario_joint_20260611-212432_hybrid_last.tar (1328.6 MB)
+2026-06-11 11:01:24:[Validation] ep 4 | loss: 2.5964 | minADE: 2.1817 m | minFDE: 5.6792 m | brierMinFDE: 6.2035 | time: 0.954 mins
+2026-06-11 11:01:24:[Branch] ep 4 | LLM corr/enc: 0.7833 | lane_cross/input: 0.0458 | scn_q/base_q: 162.3420
+2026-06-11 11:01:24:[Modes] ep 4 | oracle-winner usage: m0:23.4% m1:9.7% m2:32.9% m3:10.2% m4:11.7% m5:12.1%
+2026-06-11 11:01:24:[Anchors] ep 4 | min pairwise sep: 24.638 m
+2026-06-11 11:01:24:    anchor[0] = ( +85.50,   -0.38) | ema_count =    34.00
+2026-06-11 11:01:24:    anchor[1] = (  +3.11,   -0.00) | ema_count =   203.00
+2026-06-11 11:01:24:    anchor[2] = ( +23.75,  +24.38) | ema_count =    12.88
+2026-06-11 11:01:24:    anchor[3] = ( +55.75,   -0.24) | ema_count =    73.50
+2026-06-11 11:01:24:    anchor[4] = ( +29.75,   -0.07) | ema_count =    77.50
+2026-06-11 11:01:24:    anchor[5] = ( +21.75,  -23.38) | ema_count =    11.25
+2026-06-11 11:01:24:  >> minADE improved by 0.1457 m → 2.1817 m; saving best checkpoint...
+2026-06-11 11:01:34:  >> Saved saved_models/exp12b_scenario_joint/exp12b_scenario_joint_20260611-212432_hybrid_best.tar (1328.6 MB)
+2026-06-11 11:01:34:
+================================================================================
+2026-06-11 11:01:34:Epoch 5/40
+2026-06-11 11:01:34:  - LR              : llm_lr=4.10e-05, enc+dec_lr=8.20e-05
+2026-06-11 11:01:34:  - Batch (GPU/eff) : 56 / 224
+2026-06-11 11:01:34:  - LoRA r/α        : 32/64
+2026-06-11 11:01:34:  - Level-k          : 2
+2026-06-11 11:01:34:  - Agents/Lanes     : 6/20
+2026-06-11 11:01:34:================================================================================
+2026-06-11 11:04:09:  [ep 5 | 100/892] loss=2.6679 (avg=2.5260) | loss_l0=2.7556 | reg_loss_l0=1.9777 | cls_loss_l0=1.5559 | loss_l1=2.6663 | reg_loss_l1=1.8443 | cls_loss_l1=1.6440 | loss_l2=2.6249 | reg_loss_l2=1.8536 | cls_loss_l2=1.5426 | gn_enc=2.23 gn_llm=3.73 | 0.65 it/s | eta=20.3min | mem=1392MB
+2026-06-11 11:06:43:  [ep 5 | 200/892] loss=1.9865 (avg=2.4660) | loss_l0=1.9829 | reg_loss_l0=1.3371 | cls_loss_l0=1.2917 | loss_l1=1.9881 | reg_loss_l1=1.3509 | cls_loss_l1=1.2744 | loss_l2=1.9875 | reg_loss_l2=1.3716 | cls_loss_l2=1.2317 | gn_enc=1.97 gn_llm=2.78 | 0.65 it/s | eta=17.7min | mem=1392MB
+2026-06-11 11:09:15:  [ep 5 | 300/892] loss=2.6654 (avg=2.5425) | loss_l0=2.6846 | reg_loss_l0=2.0117 | cls_loss_l0=1.3458 | loss_l1=2.6189 | reg_loss_l1=1.9667 | cls_loss_l1=1.3045 | loss_l2=2.6790 | reg_loss_l2=1.9911 | cls_loss_l2=1.3759 | gn_enc=1.78 gn_llm=3.11 | 0.65 it/s | eta=15.1min | mem=1392MB
+2026-06-11 11:11:48:  [ep 5 | 400/892] loss=2.5555 (avg=2.5174) | loss_l0=2.5669 | reg_loss_l0=1.8796 | cls_loss_l0=1.3747 | loss_l1=2.5881 | reg_loss_l1=1.8991 | cls_loss_l1=1.3780 | loss_l2=2.5335 | reg_loss_l2=1.8896 | cls_loss_l2=1.2876 | gn_enc=2.25 gn_llm=4.41 | 0.65 it/s | eta=12.5min | mem=1392MB
+2026-06-11 11:14:20:  [ep 5 | 500/892] loss=2.3519 (avg=2.4736) | loss_l0=2.3068 | reg_loss_l0=1.6862 | cls_loss_l0=1.2411 | loss_l1=2.3599 | reg_loss_l1=1.7215 | cls_loss_l1=1.2767 | loss_l2=2.3705 | reg_loss_l2=1.7216 | cls_loss_l2=1.2980 | gn_enc=2.33 gn_llm=5.00 | 0.65 it/s | eta=10.0min | mem=1392MB
+2026-06-11 11:16:53:  [ep 5 | 600/892] loss=2.0029 (avg=2.5649) | loss_l0=2.0537 | reg_loss_l0=1.2835 | cls_loss_l0=1.5402 | loss_l1=1.9560 | reg_loss_l1=1.2276 | cls_loss_l1=1.4566 | loss_l2=2.0010 | reg_loss_l2=1.2607 | cls_loss_l2=1.4806 | gn_enc=2.61 gn_llm=3.80 | 0.65 it/s | eta=7.4min | mem=1392MB
+2026-06-11 11:19:26:  [ep 5 | 700/892] loss=2.4243 (avg=2.5409) | loss_l0=2.3754 | reg_loss_l0=1.7432 | cls_loss_l0=1.2644 | loss_l1=2.4141 | reg_loss_l1=1.7719 | cls_loss_l1=1.2844 | loss_l2=2.4538 | reg_loss_l2=1.8023 | cls_loss_l2=1.3030 | gn_enc=1.48 gn_llm=2.67 | 0.65 it/s | eta=4.9min | mem=1392MB
+2026-06-11 11:21:59:  [ep 5 | 800/892] loss=2.1443 (avg=2.4867) | loss_l0=2.1525 | reg_loss_l0=1.5283 | cls_loss_l0=1.2483 | loss_l1=2.1563 | reg_loss_l1=1.5264 | cls_loss_l1=1.2598 | loss_l2=2.1343 | reg_loss_l2=1.5117 | cls_loss_l2=1.2451 | gn_enc=2.31 gn_llm=3.22 | 0.65 it/s | eta=2.3min | mem=1392MB
+2026-06-11 11:24:20:  [ep 5 | 892/892] loss=2.5068 (avg=2.4126) | loss_l0=2.5753 | reg_loss_l0=1.8680 | cls_loss_l0=1.4146 | loss_l1=2.4921 | reg_loss_l1=1.8084 | cls_loss_l1=1.3673 | loss_l2=2.4800 | reg_loss_l2=1.8030 | cls_loss_l2=1.3541 | gn_enc=1.60 gn_llm=2.77 | 0.65 it/s | eta=0.0min | mem=1392MB
+2026-06-11 11:24:20:[Train] ep 5 avg_loss=2.5170 | time=22.74min | peak_mem=84757MB
+2026-06-11 11:24:30:  >> Saved saved_models/exp12b_scenario_joint/exp12b_scenario_joint_20260611-212432_hybrid_last.tar (1328.6 MB)
+2026-06-11 11:25:27:[Validation] ep 5 | loss: 2.4870 | minADE: 2.0885 m | minFDE: 5.4689 m | brierMinFDE: 5.9621 | time: 0.954 mins
+2026-06-11 11:25:27:[Branch] ep 5 | LLM corr/enc: 0.8159 | lane_cross/input: 0.0425 | scn_q/base_q: 161.0780
+2026-06-11 11:25:27:[Modes] ep 5 | oracle-winner usage: m0:22.9% m1:9.5% m2:34.6% m3:10.2% m4:9.6% m5:13.1%
+2026-06-11 11:25:27:[Anchors] ep 5 | min pairwise sep: 24.308 m
+2026-06-11 11:25:27:    anchor[0] = ( +84.00,   -0.43) | ema_count =    36.00
+2026-06-11 11:25:27:    anchor[1] = (  +3.12,   +0.01) | ema_count =   201.00
+2026-06-11 11:25:27:    anchor[2] = ( +23.25,  +24.12) | ema_count =    13.00
+2026-06-11 11:25:27:    anchor[3] = ( +55.00,   -0.25) | ema_count =    75.50
+2026-06-11 11:25:27:    anchor[4] = ( +29.50,   -0.07) | ema_count =    76.50
+2026-06-11 11:25:27:    anchor[5] = ( +20.75,  -22.75) | ema_count =    11.62
+2026-06-11 11:25:27:  >> minADE improved by 0.0932 m → 2.0885 m; saving best checkpoint...
+2026-06-11 11:25:37:  >> Saved saved_models/exp12b_scenario_joint/exp12b_scenario_joint_20260611-212432_hybrid_best.tar (1328.6 MB)
+2026-06-11 11:25:37:
+================================================================================
+2026-06-11 11:25:37:Epoch 6/40
+2026-06-11 11:25:37:  - LR              : llm_lr=5.00e-05, enc+dec_lr=1.00e-04
+2026-06-11 11:25:37:  - Batch (GPU/eff) : 56 / 224
+2026-06-11 11:25:37:  - LoRA r/α        : 32/64
+2026-06-11 11:25:37:  - Level-k          : 2
+2026-06-11 11:25:37:  - Agents/Lanes     : 6/20
+2026-06-11 11:25:37:================================================================================
+2026-06-11 11:28:13:  [ep 6 | 100/892] loss=1.8298 (avg=2.4838) | loss_l0=1.8425 | reg_loss_l0=1.1289 | cls_loss_l0=1.4273 | loss_l1=1.8272 | reg_loss_l1=1.1054 | cls_loss_l1=1.4437 | loss_l2=1.8247 | reg_loss_l2=1.1199 | cls_loss_l2=1.4096 | gn_enc=2.50 gn_llm=3.81 | 0.65 it/s | eta=20.4min | mem=1392MB
+2026-06-11 11:30:45:  [ep 6 | 200/892] loss=2.0415 (avg=2.4882) | loss_l0=2.0401 | reg_loss_l0=1.3644 | cls_loss_l0=1.3513 | loss_l1=2.0380 | reg_loss_l1=1.3583 | cls_loss_l1=1.3593 | loss_l2=2.0440 | reg_loss_l2=1.3562 | cls_loss_l2=1.3757 | gn_enc=2.28 gn_llm=3.39 | 0.65 it/s | eta=17.7min | mem=1392MB
+2026-06-11 11:33:18:  [ep 6 | 300/892] loss=2.1071 (avg=2.3640) | loss_l0=2.0952 | reg_loss_l0=1.3813 | cls_loss_l0=1.4277 | loss_l1=2.1072 | reg_loss_l1=1.3749 | cls_loss_l1=1.4645 | loss_l2=2.1129 | reg_loss_l2=1.3663 | cls_loss_l2=1.4933 | gn_enc=3.55 gn_llm=4.25 | 0.65 it/s | eta=15.1min | mem=1392MB
+2026-06-11 11:35:51:  [ep 6 | 400/892] loss=2.2090 (avg=2.4548) | loss_l0=2.2658 | reg_loss_l0=1.6535 | cls_loss_l0=1.2247 | loss_l1=2.1754 | reg_loss_l1=1.5876 | cls_loss_l1=1.1756 | loss_l2=2.1974 | reg_loss_l2=1.6057 | cls_loss_l2=1.1833 | gn_enc=1.86 gn_llm=2.84 | 0.65 it/s | eta=12.6min | mem=1392MB
+2026-06-11 11:38:24:  [ep 6 | 500/892] loss=2.0549 (avg=2.4291) | loss_l0=2.0541 | reg_loss_l0=1.3739 | cls_loss_l0=1.3605 | loss_l1=2.0739 | reg_loss_l1=1.3764 | cls_loss_l1=1.3951 | loss_l2=2.0458 | reg_loss_l2=1.3722 | cls_loss_l2=1.3471 | gn_enc=2.09 gn_llm=2.89 | 0.65 it/s | eta=10.0min | mem=1392MB
+2026-06-11 11:40:57:  [ep 6 | 600/892] loss=2.3950 (avg=2.4343) | loss_l0=2.4446 | reg_loss_l0=1.6989 | cls_loss_l0=1.4914 | loss_l1=2.3824 | reg_loss_l1=1.6121 | cls_loss_l1=1.5407 | loss_l2=2.3765 | reg_loss_l2=1.6122 | cls_loss_l2=1.5285 | gn_enc=1.98 gn_llm=3.00 | 0.65 it/s | eta=7.4min | mem=1392MB
+2026-06-11 11:43:30:  [ep 6 | 700/892] loss=2.4906 (avg=2.4364) | loss_l0=2.5557 | reg_loss_l0=1.8879 | cls_loss_l0=1.3356 | loss_l1=2.4739 | reg_loss_l1=1.8258 | cls_loss_l1=1.2963 | loss_l2=2.4664 | reg_loss_l2=1.8301 | cls_loss_l2=1.2726 | gn_enc=2.52 gn_llm=3.95 | 0.65 it/s | eta=4.9min | mem=1392MB
+2026-06-11 11:46:02:  [ep 6 | 800/892] loss=2.4803 (avg=2.4077) | loss_l0=2.4698 | reg_loss_l0=1.8131 | cls_loss_l0=1.3134 | loss_l1=2.4908 | reg_loss_l1=1.7997 | cls_loss_l1=1.3823 | loss_l2=2.4803 | reg_loss_l2=1.7936 | cls_loss_l2=1.3733 | gn_enc=2.34 gn_llm=3.67 | 0.65 it/s | eta=2.3min | mem=1392MB
+2026-06-11 11:48:23:  [ep 6 | 892/892] loss=2.2425 (avg=2.4014) | loss_l0=2.2691 | reg_loss_l0=1.6022 | cls_loss_l0=1.3337 | loss_l1=2.2556 | reg_loss_l1=1.5927 | cls_loss_l1=1.3258 | loss_l2=2.2226 | reg_loss_l2=1.5747 | cls_loss_l2=1.2958 | gn_enc=2.30 gn_llm=2.73 | 0.65 it/s | eta=0.0min | mem=1392MB
+2026-06-11 11:48:23:[Train] ep 6 avg_loss=2.4283 | time=22.74min | peak_mem=84818MB
+2026-06-11 11:48:33:  >> Saved saved_models/exp12b_scenario_joint/exp12b_scenario_joint_20260611-212432_hybrid_last.tar (1328.6 MB)
+2026-06-11 11:49:30:[Validation] ep 6 | loss: 2.4084 | minADE: 1.9878 m | minFDE: 5.2072 m | brierMinFDE: 5.7293 | time: 0.955 mins
+2026-06-11 11:49:30:[Branch] ep 6 | LLM corr/enc: 0.8589 | lane_cross/input: 0.0411 | scn_q/base_q: 156.0903
+2026-06-11 11:49:30:[Modes] ep 6 | oracle-winner usage: m0:23.3% m1:9.2% m2:33.9% m3:9.9% m4:8.5% m5:15.2%
+2026-06-11 11:49:30:[Anchors] ep 6 | min pairwise sep: 24.390 m
+2026-06-11 11:49:30:    anchor[0] = ( +86.00,   -0.40) | ema_count =    34.25
+2026-06-11 11:49:30:    anchor[1] = (  +3.09,   +0.01) | ema_count =   206.00
+2026-06-11 11:49:30:    anchor[2] = ( +23.75,  +25.00) | ema_count =    12.81
+2026-06-11 11:49:30:    anchor[3] = ( +54.75,   -0.19) | ema_count =    76.50
+2026-06-11 11:49:30:    anchor[4] = ( +29.50,   -0.09) | ema_count =    76.50
+2026-06-11 11:49:30:    anchor[5] = ( +21.12,  -23.00) | ema_count =    11.50
+2026-06-11 11:49:30:  >> minADE improved by 0.1008 m → 1.9878 m; saving best checkpoint...
+2026-06-11 11:49:40:  >> Saved saved_models/exp12b_scenario_joint/exp12b_scenario_joint_20260611-212432_hybrid_best.tar (1328.6 MB)
+2026-06-11 11:49:40:
+================================================================================
+2026-06-11 11:49:40:Epoch 7/40
+2026-06-11 11:49:40:  - LR              : llm_lr=4.99e-05, enc+dec_lr=9.98e-05
+2026-06-11 11:49:40:  - Batch (GPU/eff) : 56 / 224
+2026-06-11 11:49:40:  - LoRA r/α        : 32/64
+2026-06-11 11:49:40:  - Level-k          : 2
+2026-06-11 11:49:40:  - Agents/Lanes     : 6/20
+2026-06-11 11:49:40:================================================================================
+2026-06-11 11:52:15:  [ep 7 | 100/892] loss=2.1709 (avg=2.3941) | loss_l0=2.1866 | reg_loss_l0=1.6135 | cls_loss_l0=1.1461 | loss_l1=2.1598 | reg_loss_l1=1.5855 | cls_loss_l1=1.1485 | loss_l2=2.1686 | reg_loss_l2=1.5948 | cls_loss_l2=1.1476 | gn_enc=1.72 gn_llm=3.08 | 0.65 it/s | eta=20.3min | mem=1392MB
+2026-06-11 11:54:47:  [ep 7 | 200/892] loss=1.7463 (avg=2.3178) | loss_l0=1.7600 | reg_loss_l0=1.0779 | cls_loss_l0=1.3641 | loss_l1=1.7529 | reg_loss_l1=1.0769 | cls_loss_l1=1.3521 | loss_l2=1.7362 | reg_loss_l2=1.0646 | cls_loss_l2=1.3433 | gn_enc=1.68 gn_llm=3.11 | 0.65 it/s | eta=17.7min | mem=1392MB
+2026-06-11 11:57:21:  [ep 7 | 300/892] loss=2.7027 (avg=2.3840) | loss_l0=2.7235 | reg_loss_l0=1.9617 | cls_loss_l0=1.5236 | loss_l1=2.6994 | reg_loss_l1=1.9196 | cls_loss_l1=1.5595 | loss_l2=2.6939 | reg_loss_l2=1.9108 | cls_loss_l2=1.5662 | gn_enc=1.93 gn_llm=2.73 | 0.65 it/s | eta=15.1min | mem=1392MB
+2026-06-11 11:59:54:  [ep 7 | 400/892] loss=3.0696 (avg=2.4074) | loss_l0=3.0604 | reg_loss_l0=2.4004 | cls_loss_l0=1.3199 | loss_l1=3.0546 | reg_loss_l1=2.4082 | cls_loss_l1=1.2927 | loss_l2=3.0818 | reg_loss_l2=2.4224 | cls_loss_l2=1.3188 | gn_enc=2.02 gn_llm=3.12 | 0.65 it/s | eta=12.6min | mem=1392MB
+2026-06-12 12:02:27:  [ep 7 | 500/892] loss=2.2615 (avg=2.3099) | loss_l0=2.2771 | reg_loss_l0=1.5794 | cls_loss_l0=1.3955 | loss_l1=2.2592 | reg_loss_l1=1.5522 | cls_loss_l1=1.4141 | loss_l2=2.2549 | reg_loss_l2=1.5506 | cls_loss_l2=1.4085 | gn_enc=2.05 gn_llm=2.83 | 0.65 it/s | eta=10.0min | mem=1392MB
+2026-06-12 12:05:00:  [ep 7 | 600/892] loss=2.6462 (avg=2.3386) | loss_l0=2.6449 | reg_loss_l0=1.8969 | cls_loss_l0=1.4958 | loss_l1=2.6466 | reg_loss_l1=1.8985 | cls_loss_l1=1.4961 | loss_l2=2.6467 | reg_loss_l2=1.8915 | cls_loss_l2=1.5104 | gn_enc=1.98 gn_llm=3.25 | 0.65 it/s | eta=7.5min | mem=1392MB
+2026-06-12 12:07:32:  [ep 7 | 700/892] loss=2.4705 (avg=2.3287) | loss_l0=2.5670 | reg_loss_l0=1.8180 | cls_loss_l0=1.4981 | loss_l1=2.4296 | reg_loss_l1=1.6899 | cls_loss_l1=1.4793 | loss_l2=2.4426 | reg_loss_l2=1.6821 | cls_loss_l2=1.5210 | gn_enc=2.94 gn_llm=4.59 | 0.65 it/s | eta=4.9min | mem=1392MB
+2026-06-12 12:10:05:  [ep 7 | 800/892] loss=2.3306 (avg=2.3310) | loss_l0=2.3310 | reg_loss_l0=1.6357 | cls_loss_l0=1.3906 | loss_l1=2.3507 | reg_loss_l1=1.6429 | cls_loss_l1=1.4156 | loss_l2=2.3202 | reg_loss_l2=1.6184 | cls_loss_l2=1.4036 | gn_enc=2.17 gn_llm=4.44 | 0.65 it/s | eta=2.3min | mem=1392MB
+2026-06-12 12:12:25:  [ep 7 | 892/892] loss=2.2567 (avg=2.4522) | loss_l0=2.2564 | reg_loss_l0=1.5274 | cls_loss_l0=1.4580 | loss_l1=2.2331 | reg_loss_l1=1.5165 | cls_loss_l1=1.4333 | loss_l2=2.2686 | reg_loss_l2=1.5626 | cls_loss_l2=1.4120 | gn_enc=2.20 gn_llm=3.20 | 0.65 it/s | eta=0.0min | mem=1392MB
+2026-06-12 12:12:25:[Train] ep 7 avg_loss=2.3667 | time=22.73min | peak_mem=84789MB
+2026-06-12 12:12:35:  >> Saved saved_models/exp12b_scenario_joint/exp12b_scenario_joint_20260611-212432_hybrid_last.tar (1328.6 MB)
+2026-06-12 12:13:32:[Validation] ep 7 | loss: 2.3760 | minADE: 1.9369 m | minFDE: 5.0951 m | brierMinFDE: 5.6027 | time: 0.955 mins
+2026-06-12 12:13:32:[Branch] ep 7 | LLM corr/enc: 0.8590 | lane_cross/input: 0.0334 | scn_q/base_q: 157.7775
+2026-06-12 12:13:32:[Modes] ep 7 | oracle-winner usage: m0:23.5% m1:9.5% m2:31.4% m3:10.1% m4:8.5% m5:16.9%
+2026-06-12 12:13:32:[Anchors] ep 7 | min pairwise sep: 24.725 m
+2026-06-12 12:13:32:    anchor[0] = ( +85.00,   -0.44) | ema_count =    34.25
+2026-06-12 12:13:32:    anchor[1] = (  +3.03,   -0.00) | ema_count =   203.00
+2026-06-12 12:13:32:    anchor[2] = ( +23.50,  +24.75) | ema_count =    13.19
+2026-06-12 12:13:32:    anchor[3] = ( +54.75,   -0.24) | ema_count =    77.00
+2026-06-12 12:13:32:    anchor[4] = ( +29.75,   -0.15) | ema_count =    76.00
+2026-06-12 12:13:32:    anchor[5] = ( +22.00,  -23.62) | ema_count =    11.00
+2026-06-12 12:13:32:  >> minADE improved by 0.0509 m → 1.9369 m; saving best checkpoint...
+2026-06-12 12:13:43:  >> Saved saved_models/exp12b_scenario_joint/exp12b_scenario_joint_20260611-212432_hybrid_best.tar (1328.6 MB)
+2026-06-12 12:13:43:
+================================================================================
+2026-06-12 12:13:43:Epoch 8/40
+2026-06-12 12:13:43:  - LR              : llm_lr=4.96e-05, enc+dec_lr=9.93e-05
+2026-06-12 12:13:43:  - Batch (GPU/eff) : 56 / 224
+2026-06-12 12:13:43:  - LoRA r/α        : 32/64
+2026-06-12 12:13:43:  - Level-k          : 2
+2026-06-12 12:13:43:  - Agents/Lanes     : 6/20
+2026-06-12 12:13:43:================================================================================
+2026-06-12 12:16:18:  [ep 8 | 100/892] loss=2.3823 (avg=2.3077) | loss_l0=2.4095 | reg_loss_l0=1.6812 | cls_loss_l0=1.4565 | loss_l1=2.4008 | reg_loss_l1=1.7011 | cls_loss_l1=1.3994 | loss_l2=2.3595 | reg_loss_l2=1.6618 | cls_loss_l2=1.3954 | gn_enc=2.69 gn_llm=4.06 | 0.65 it/s | eta=20.3min | mem=1392MB
+2026-06-12 12:18:51:  [ep 8 | 200/892] loss=2.0173 (avg=2.3721) | loss_l0=2.0160 | reg_loss_l0=1.4123 | cls_loss_l0=1.2074 | loss_l1=2.0046 | reg_loss_l1=1.3977 | cls_loss_l1=1.2139 | loss_l2=2.0244 | reg_loss_l2=1.4064 | cls_loss_l2=1.2360 | gn_enc=2.02 gn_llm=2.78 | 0.65 it/s | eta=17.7min | mem=1392MB
+2026-06-12 12:21:24:  [ep 8 | 300/892] loss=2.5173 (avg=2.2567) | loss_l0=2.5612 | reg_loss_l0=1.8280 | cls_loss_l0=1.4665 | loss_l1=2.5182 | reg_loss_l1=1.7627 | cls_loss_l1=1.5110 | loss_l2=2.4950 | reg_loss_l2=1.7710 | cls_loss_l2=1.4479 | gn_enc=2.48 gn_llm=3.72 | 0.65 it/s | eta=15.1min | mem=1392MB
+2026-06-12 12:23:57:  [ep 8 | 400/892] loss=1.8417 (avg=2.2598) | loss_l0=1.8794 | reg_loss_l0=1.1804 | cls_loss_l0=1.3979 | loss_l1=1.8401 | reg_loss_l1=1.1739 | cls_loss_l1=1.3323 | loss_l2=1.8237 | reg_loss_l2=1.1541 | cls_loss_l2=1.3393 | gn_enc=2.03 gn_llm=3.30 | 0.65 it/s | eta=12.6min | mem=1392MB
+2026-06-12 12:26:30:  [ep 8 | 500/892] loss=1.9525 (avg=2.2549) | loss_l0=1.9343 | reg_loss_l0=1.2504 | cls_loss_l0=1.3678 | loss_l1=1.9234 | reg_loss_l1=1.2650 | cls_loss_l1=1.3169 | loss_l2=1.9762 | reg_loss_l2=1.3270 | cls_loss_l2=1.2984 | gn_enc=2.62 gn_llm=3.22 | 0.65 it/s | eta=10.0min | mem=1392MB
+2026-06-12 12:29:02:  [ep 8 | 600/892] loss=1.8158 (avg=2.3191) | loss_l0=1.8738 | reg_loss_l0=1.2782 | cls_loss_l0=1.1912 | loss_l1=1.8235 | reg_loss_l1=1.2555 | cls_loss_l1=1.1360 | loss_l2=1.7830 | reg_loss_l2=1.2159 | cls_loss_l2=1.1341 | gn_enc=2.52 gn_llm=3.41 | 0.65 it/s | eta=7.4min | mem=1392MB
+2026-06-12 12:31:35:  [ep 8 | 700/892] loss=2.1469 (avg=2.3813) | loss_l0=2.1943 | reg_loss_l0=1.5122 | cls_loss_l0=1.3642 | loss_l1=2.1229 | reg_loss_l1=1.4825 | cls_loss_l1=1.2809 | loss_l2=2.1352 | reg_loss_l2=1.4773 | cls_loss_l2=1.3157 | gn_enc=2.41 gn_llm=3.03 | 0.65 it/s | eta=4.9min | mem=1392MB
+2026-06-12 12:34:08:  [ep 8 | 800/892] loss=2.1266 (avg=2.3376) | loss_l0=2.1319 | reg_loss_l0=1.4442 | cls_loss_l0=1.3755 | loss_l1=2.1352 | reg_loss_l1=1.4385 | cls_loss_l1=1.3933 | loss_l2=2.1197 | reg_loss_l2=1.4347 | cls_loss_l2=1.3699 | gn_enc=2.09 gn_llm=3.08 | 0.65 it/s | eta=2.3min | mem=1392MB
+2026-06-12 12:36:29:  [ep 8 | 892/892] loss=1.8841 (avg=2.3843) | loss_l0=1.9182 | reg_loss_l0=1.2422 | cls_loss_l0=1.3519 | loss_l1=1.8761 | reg_loss_l1=1.2329 | cls_loss_l1=1.2865 | loss_l2=1.8711 | reg_loss_l2=1.2471 | cls_loss_l2=1.2481 | gn_enc=1.78 gn_llm=2.91 | 0.65 it/s | eta=0.0min | mem=1392MB
+2026-06-12 12:36:29:[Train] ep 8 avg_loss=2.3226 | time=22.74min | peak_mem=84809MB
+2026-06-12 12:36:39:  >> Saved saved_models/exp12b_scenario_joint/exp12b_scenario_joint_20260611-212432_hybrid_last.tar (1328.6 MB)
+2026-06-12 12:37:36:[Validation] ep 8 | loss: 2.3401 | minADE: 1.9374 m | minFDE: 5.1118 m | brierMinFDE: 5.6015 | time: 0.955 mins
+2026-06-12 12:37:36:[Branch] ep 8 | LLM corr/enc: 0.8616 | lane_cross/input: 0.0287 | scn_q/base_q: 149.2227
+2026-06-12 12:37:36:[Modes] ep 8 | oracle-winner usage: m0:23.6% m1:10.2% m2:34.4% m3:9.5% m4:8.1% m5:14.3%
+2026-06-12 12:37:36:[Anchors] ep 8 | min pairwise sep: 25.552 m
+2026-06-12 12:37:36:    anchor[0] = ( +84.00,   -0.38) | ema_count =    35.75
+2026-06-12 12:37:36:    anchor[1] = (  +3.05,   +0.01) | ema_count =   203.00
+2026-06-12 12:37:36:    anchor[2] = ( +24.00,  +24.88) | ema_count =    13.12
+2026-06-12 12:37:36:    anchor[3] = ( +55.50,   -0.18) | ema_count =    76.00
+2026-06-12 12:37:36:    anchor[4] = ( +29.88,   -0.09) | ema_count =    76.00
+2026-06-12 12:37:36:    anchor[5] = ( +20.88,  -24.00) | ema_count =    11.56
+2026-06-12 12:37:36:  -- No minADE improvement (best=1.9369 m, current=1.9374 m) | patience 1/5
+2026-06-12 12:37:36:
+================================================================================
+2026-06-12 12:37:36:Epoch 9/40
+2026-06-12 12:37:36:  - LR              : llm_lr=4.92e-05, enc+dec_lr=9.84e-05
+2026-06-12 12:37:36:  - Batch (GPU/eff) : 56 / 224
+2026-06-12 12:37:36:  - LoRA r/α        : 32/64
+2026-06-12 12:37:36:  - Level-k          : 2
+2026-06-12 12:37:36:  - Agents/Lanes     : 6/20
+2026-06-12 12:37:36:================================================================================
+2026-06-12 12:40:11:  [ep 9 | 100/892] loss=2.4830 (avg=2.2809) | loss_l0=2.4671 | reg_loss_l0=1.7417 | cls_loss_l0=1.4508 | loss_l1=2.4834 | reg_loss_l1=1.7783 | cls_loss_l1=1.4102 | loss_l2=2.4908 | reg_loss_l2=1.7886 | cls_loss_l2=1.4044 | gn_enc=1.98 gn_llm=3.28 | 0.65 it/s | eta=20.3min | mem=1392MB
+2026-06-12 12:42:44:  [ep 9 | 200/892] loss=2.3135 (avg=2.2597) | loss_l0=2.3442 | reg_loss_l0=1.6164 | cls_loss_l0=1.4555 | loss_l1=2.3007 | reg_loss_l1=1.5885 | cls_loss_l1=1.4244 | loss_l2=2.3045 | reg_loss_l2=1.5938 | cls_loss_l2=1.4214 | gn_enc=2.03 gn_llm=2.83 | 0.65 it/s | eta=17.7min | mem=1392MB
+2026-06-12 12:45:17:  [ep 9 | 300/892] loss=1.9880 (avg=2.2159) | loss_l0=2.0356 | reg_loss_l0=1.3281 | cls_loss_l0=1.4150 | loss_l1=1.9779 | reg_loss_l1=1.2584 | cls_loss_l1=1.4390 | loss_l2=1.9693 | reg_loss_l2=1.2678 | cls_loss_l2=1.4030 | gn_enc=2.28 gn_llm=3.66 | 0.65 it/s | eta=15.1min | mem=1392MB
+2026-06-12 12:47:50:  [ep 9 | 400/892] loss=2.7519 (avg=2.3246) | loss_l0=2.8256 | reg_loss_l0=2.1051 | cls_loss_l0=1.4409 | loss_l1=2.7488 | reg_loss_l1=2.0566 | cls_loss_l1=1.3845 | loss_l2=2.7166 | reg_loss_l2=2.0253 | cls_loss_l2=1.3827 | gn_enc=2.70 gn_llm=3.59 | 0.65 it/s | eta=12.6min | mem=1392MB
+2026-06-12 12:50:23:  [ep 9 | 500/892] loss=2.2662 (avg=2.2989) | loss_l0=2.2859 | reg_loss_l0=1.6164 | cls_loss_l0=1.3391 | loss_l1=2.2389 | reg_loss_l1=1.5848 | cls_loss_l1=1.3083 | loss_l2=2.2700 | reg_loss_l2=1.5821 | cls_loss_l2=1.3758 | gn_enc=2.34 gn_llm=3.38 | 0.65 it/s | eta=10.0min | mem=1392MB
+2026-06-12 12:52:56:  [ep 9 | 600/892] loss=2.6417 (avg=2.2390) | loss_l0=2.6890 | reg_loss_l0=1.9868 | cls_loss_l0=1.4045 | loss_l1=2.5980 | reg_loss_l1=1.9308 | cls_loss_l1=1.3343 | loss_l2=2.6399 | reg_loss_l2=1.9700 | cls_loss_l2=1.3398 | gn_enc=2.48 gn_llm=3.33 | 0.65 it/s | eta=7.4min | mem=1392MB
+2026-06-12 12:55:29:  [ep 9 | 700/892] loss=2.3370 (avg=2.2530) | loss_l0=2.3252 | reg_loss_l0=1.6982 | cls_loss_l0=1.2539 | loss_l1=2.3236 | reg_loss_l1=1.6893 | cls_loss_l1=1.2686 | loss_l2=2.3496 | reg_loss_l2=1.7260 | cls_loss_l2=1.2472 | gn_enc=2.80 gn_llm=4.25 | 0.65 it/s | eta=4.9min | mem=1392MB
+2026-06-12 12:58:01:  [ep 9 | 800/892] loss=2.1525 (avg=2.2312) | loss_l0=2.1394 | reg_loss_l0=1.5140 | cls_loss_l0=1.2508 | loss_l1=2.1521 | reg_loss_l1=1.5167 | cls_loss_l1=1.2708 | loss_l2=2.1592 | reg_loss_l2=1.5311 | cls_loss_l2=1.2563 | gn_enc=2.09 gn_llm=3.12 | 0.65 it/s | eta=2.3min | mem=1392MB
+2026-06-12 01:00:22:  [ep 9 | 892/892] loss=2.0733 (avg=2.2678) | loss_l0=2.0609 | reg_loss_l0=1.4019 | cls_loss_l0=1.3180 | loss_l1=2.0635 | reg_loss_l1=1.3934 | cls_loss_l1=1.3403 | loss_l2=2.0843 | reg_loss_l2=1.4151 | cls_loss_l2=1.3384 | gn_enc=2.53 gn_llm=3.53 | 0.65 it/s | eta=0.0min | mem=1392MB
+2026-06-12 01:00:22:[Train] ep 9 avg_loss=2.2704 | time=22.74min | peak_mem=84733MB
+2026-06-12 01:00:32:  >> Saved saved_models/exp12b_scenario_joint/exp12b_scenario_joint_20260611-212432_hybrid_last.tar (1328.6 MB)
+2026-06-12 01:01:29:[Validation] ep 9 | loss: 2.3301 | minADE: 1.9629 m | minFDE: 5.1773 m | brierMinFDE: 5.6577 | time: 0.955 mins
+2026-06-12 01:01:29:[Branch] ep 9 | LLM corr/enc: 0.8623 | lane_cross/input: 0.0272 | scn_q/base_q: 151.2232
+2026-06-12 01:01:29:[Modes] ep 9 | oracle-winner usage: m0:20.0% m1:9.5% m2:39.3% m3:9.7% m4:8.1% m5:13.3%
+2026-06-12 01:01:29:[Anchors] ep 9 | min pairwise sep: 24.887 m
+2026-06-12 01:01:29:    anchor[0] = ( +84.50,   -0.34) | ema_count =    35.00
+2026-06-12 01:01:29:    anchor[1] = (  +3.03,   +0.01) | ema_count =   205.00
+2026-06-12 01:01:29:    anchor[2] = ( +23.50,  +24.38) | ema_count =    13.12
+2026-06-12 01:01:29:    anchor[3] = ( +55.50,   -0.20) | ema_count =    76.00
+2026-06-12 01:01:29:    anchor[4] = ( +29.75,   -0.12) | ema_count =    76.00
+2026-06-12 01:01:29:    anchor[5] = ( +20.25,  -23.12) | ema_count =    11.25
+2026-06-12 01:01:29:  -- No minADE improvement (best=1.9369 m, current=1.9629 m) | patience 2/5
+2026-06-12 01:01:29:
+================================================================================
+2026-06-12 01:01:29:Epoch 10/40
+2026-06-12 01:01:29:  - LR              : llm_lr=4.86e-05, enc+dec_lr=9.71e-05
+2026-06-12 01:01:29:  - Batch (GPU/eff) : 56 / 224
+2026-06-12 01:01:29:  - LoRA r/α        : 32/64
+2026-06-12 01:01:29:  - Level-k          : 2
+2026-06-12 01:01:29:  - Agents/Lanes     : 6/20
+2026-06-12 01:01:29:================================================================================
+2026-06-12 01:04:05:  [ep 10 | 100/892] loss=2.3443 (avg=2.1617) | loss_l0=2.3598 | reg_loss_l0=1.7673 | cls_loss_l0=1.1850 | loss_l1=2.3513 | reg_loss_l1=1.7567 | cls_loss_l1=1.1891 | loss_l2=2.3330 | reg_loss_l2=1.7393 | cls_loss_l2=1.1875 | gn_enc=2.77 gn_llm=3.66 | 0.65 it/s | eta=20.3min | mem=1392MB
+2026-06-12 01:06:37:  [ep 10 | 200/892] loss=2.7793 (avg=2.1940) | loss_l0=2.7335 | reg_loss_l0=2.0456 | cls_loss_l0=1.3757 | loss_l1=2.7483 | reg_loss_l1=2.0618 | cls_loss_l1=1.3729 | loss_l2=2.8177 | reg_loss_l2=2.1232 | cls_loss_l2=1.3891 | gn_enc=2.94 gn_llm=4.97 | 0.65 it/s | eta=17.7min | mem=1392MB
+2026-06-12 01:09:10:  [ep 10 | 300/892] loss=1.9331 (avg=2.2666) | loss_l0=1.9462 | reg_loss_l0=1.2311 | cls_loss_l0=1.4302 | loss_l1=1.9332 | reg_loss_l1=1.2256 | cls_loss_l1=1.4151 | loss_l2=1.9264 | reg_loss_l2=1.2146 | cls_loss_l2=1.4236 | gn_enc=2.70 gn_llm=3.95 | 0.65 it/s | eta=15.1min | mem=1392MB
+2026-06-12 01:11:43:  [ep 10 | 400/892] loss=2.1037 (avg=2.2319) | loss_l0=2.1294 | reg_loss_l0=1.4145 | cls_loss_l0=1.4298 | loss_l1=2.1052 | reg_loss_l1=1.3591 | cls_loss_l1=1.4922 | loss_l2=2.0901 | reg_loss_l2=1.3418 | cls_loss_l2=1.4968 | gn_enc=2.64 gn_llm=3.61 | 0.65 it/s | eta=12.6min | mem=1392MB
+2026-06-12 01:14:16:  [ep 10 | 500/892] loss=2.1744 (avg=2.2296) | loss_l0=2.1726 | reg_loss_l0=1.3961 | cls_loss_l0=1.5530 | loss_l1=2.1817 | reg_loss_l1=1.4023 | cls_loss_l1=1.5588 | loss_l2=2.1716 | reg_loss_l2=1.4026 | cls_loss_l2=1.5380 | gn_enc=2.38 gn_llm=3.44 | 0.65 it/s | eta=10.0min | mem=1392MB

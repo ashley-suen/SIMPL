@@ -101,14 +101,13 @@ def parse_arguments():
                              "list (e.g. 'q_proj,v_proj') for selective targeting.")
 
     # Loss
-    parser.add_argument("--soft_wta_alpha",    type=float, default=0.1)
+    parser.add_argument("--soft_wta_alpha",    type=float, default=0.0,
+                        help="Weight for non-winner modes in soft WTA. 0.0 (default) "
+                             "= pure scene-level WTA (exp12): alpha>0 pulls all modes "
+                             "toward the conditional mean, fighting mode diversity")
     parser.add_argument("--cls_weight",        type=float, default=0.5,
                         help="Weight for scene-level mode-classification loss "
                              "(supervises per-mode confidence; needed for brierMinFDE)")
-    parser.add_argument("--anchor_cls_weight", type=float, default=0.5,
-                        help="Weight for per-agent anchor-classification loss (B2): "
-                             "hard-assigns each GT endpoint to its nearest learnable "
-                             "anchor — the multi-modal diversity regulariser")
 
     # Ablation
     parser.add_argument("--llm_correction_scale", type=float, default=1.0,
@@ -117,14 +116,22 @@ def parse_arguments():
                              "encoder-only (LLM correction zeroed out; LLM LoRA grad "
                              "is also killed since d_loss/d_h_correction=0). Use 0.0 "
                              "to test whether LLM dominance is capping minADE.")
+    parser.add_argument("--scene_guidance_scale", type=float, default=1.0,
+                        help="Scale applied to the LLM [SCN] scenario-query delta in "
+                             "the decoder (exp12). 1.0 = normal. 0.0 = exp12-A "
+                             "ablation: scenario queries are pure learned embeddings, "
+                             "isolating the decoder-restructure gain from the LLM "
+                             "scene-guidance gain.")
 
     # Optimiser
     parser.add_argument("--llm_lr",    type=float, default=5e-5)
     parser.add_argument("--gru_lr",    type=float, default=1e-4)
     parser.add_argument("--grad_clip",     type=float, default=5.0,
                         help="Gradient clip for encoder+decoder params (GameFormer uses 5.0)")
-    parser.add_argument("--llm_grad_clip", type=float, default=1.0,
-                        help="Gradient clip for LLM LoRA params (separate from encoder)")
+    parser.add_argument("--llm_grad_clip", type=float, default=2.5,
+                        help="Gradient clip for LLM LoRA params (separate from encoder). "
+                             "exp11 showed pre-clip norms of ~10 at 1.0 — the LLM branch "
+                             "was being truncated to 10% of its desired step")
     parser.add_argument("--grad_accum_steps", type=int, default=1)
 
     # Scheduler
@@ -273,7 +280,7 @@ def main():
         dl_train = DataLoader(full_train_set, batch_size=args.train_batch_size,
                               sampler=train_sampler, num_workers=args.num_workers,
                               pin_memory=True, persistent_workers=persistent,
-                              collate_fn=hybrid_collate_fn)
+                              collate_fn=hybrid_collate_fn, drop_last=True)
     else:
         train_sampler = dl_train = None
 
@@ -324,10 +331,12 @@ def main():
     model = DDP(model, device_ids=[local_rank], output_device=local_rank,
                 find_unused_parameters=True)
 
-    # Route-A ablation: set LLM correction scale on the underlying module so it
-    # survives DDP wrapping.  scale=0.0 → encoder-only (LLM correction zeroed).
-    (model.module if isinstance(model, DDP) else model).llm_correction_scale = \
-        args.llm_correction_scale
+    # Ablation knobs on the underlying module so they survive DDP wrapping.
+    # llm_correction_scale=0.0 → encoder-only (LLM correction zeroed).
+    # scene_guidance_scale=0.0 → exp12-A (scenario queries without LLM guidance).
+    _raw = model.module if isinstance(model, DDP) else model
+    _raw.llm_correction_scale = args.llm_correction_scale
+    _raw.traj_decoder.scene_guidance_scale = args.scene_guidance_scale
 
     if args.compile:
         model = torch.compile(model, mode=args.compile_mode, dynamic=False)
@@ -336,8 +345,7 @@ def main():
     # ── 3. Loss ───────────────────────────────────────────────────────────────
     loss_fn = HybridMotionLoss(n_levels=args.n_levels, device=device,
                                soft_wta_alpha=args.soft_wta_alpha,
-                               cls_weight=args.cls_weight,
-                               anchor_cls_weight=args.anchor_cls_weight)
+                               cls_weight=args.cls_weight)
     if is_main:
         n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in model.parameters())
@@ -347,13 +355,16 @@ def main():
                      f"weights={loss_fn.level_weights}")
         logger.print(f"[Ablation] llm_correction_scale={args.llm_correction_scale} "
                      f"({'encoder-only, LLM correction zeroed' if args.llm_correction_scale == 0.0 else 'normal LLM path'})")
+        logger.print(f"[Ablation] scene_guidance_scale={args.scene_guidance_scale} "
+                     f"({'exp12-A: no LLM scenario guidance' if args.scene_guidance_scale == 0.0 else 'LLM scenario guidance ON'})")
 
     # ── 4. Optimiser (Differential LR) ────────────────────────────────────────
-    # llm_correction_proj bridges LLM→encoder space; it must be in the slow group
-    # (llm_lr) alongside LoRA. If placed in enc_params (gru_lr=2× faster), it
-    # outpaces the LoRA weights that produce h_llm, amplifying random LLM noise
-    # into the encoder before the LLM has converged (diag_corr_ratio >> 1 at ep1).
-    _slow_keywords = ("llm.",  "llm_correction_proj")
+    # llm_correction_proj / scene_proj bridge LLM→decoder space; they must be in
+    # the slow group (llm_lr) alongside LoRA. If placed in enc_params (gru_lr=2×
+    # faster), they outpace the LoRA weights that produce h_llm/h_scn, amplifying
+    # random LLM noise into the decoder before the LLM has converged
+    # (diag_corr_ratio >> 1 at ep1 — observed in exp10 before the fix).
+    _slow_keywords = ("llm.",  "llm_correction_proj", "scene_proj")
     llm_params = [p for n, p in model.named_parameters()
                   if p.requires_grad and any(k in n for k in _slow_keywords)]
     enc_params = [p for n, p in model.named_parameters()
@@ -424,7 +435,7 @@ def main():
             dl_train = DataLoader(ep_set, batch_size=args.train_batch_size,
                                   sampler=train_sampler, num_workers=args.num_workers,
                                   pin_memory=True, persistent_workers=False,
-                                  collate_fn=hybrid_collate_fn)
+                                  collate_fn=hybrid_collate_fn, drop_last=True)
             iters_per_epoch = len(dl_train)
 
         train_sampler.set_epoch(epoch)
@@ -535,6 +546,9 @@ def main():
         val_meter = AverageMeterForDict()
         ade_meter = AverageMeterForDict()
         val_start = time.time()
+        # Winner-mode usage histogram (mode-collapse monitor, exp12): counts how
+        # often each mode is the per-scene oracle FDE winner across the val set.
+        mode_hist = torch.zeros(args.num_modes, device=device)
 
         val_sampler.set_epoch(epoch)
 
@@ -605,6 +619,8 @@ def main():
                 best_fde_idx = scene_fde.argmin(dim=1)                        # [B]
                 p_best      = scene_prob.gather(1, best_fde_idx.unsqueeze(1)).squeeze(1)  # [B]
                 brier_fde   = (scene_fde.min(dim=1).values + (1.0 - p_best) ** 2).mean()
+                mode_hist  += torch.bincount(best_fde_idx,
+                                             minlength=args.num_modes).float()
 
                 ade_meter.update({"minADE": min_ade.item(), "minFDE": min_fde.item(),
                                   "brierMinFDE": brier_fde.item()})
@@ -634,6 +650,7 @@ def main():
         global_vals   = global_tensor.tolist()
         val_loss_avg, min_ade_avg, min_fde_avg, brier_fde_avg = global_vals[:4]
         extra_avgs    = dict(zip(extra_keys, global_vals[4:]))
+        dist.all_reduce(mode_hist)                              # collective on every rank
 
         if is_main:
             logger.print(
@@ -661,10 +678,23 @@ def main():
             # nan instead of crashing the whole run.
             _corr = getattr(raw_cb, "diag_corr_ratio", float("nan"))
             _lane = getattr(raw_cb, "diag_lane_ratio", float("nan"))
+            _scn  = getattr(raw_cb, "diag_scn_ratio",  float("nan"))
             logger.print(f"[Branch] ep {epoch+1} | LLM corr/enc: {_corr:.4f} "
-                         f"| lane_cross/input: {_lane:.4f}")
+                         f"| lane_cross/input: {_lane:.4f} "
+                         f"| scn_q/base_q: {_scn:.4f}")
             logger.add_scalar("diag/llm_corr_ratio", _corr, it=epoch)
             logger.add_scalar("diag/lane_ratio",     _lane, it=epoch)
+            logger.add_scalar("diag/scn_ratio",      _scn,  it=epoch)
+
+            # ── Winner-mode usage histogram (mode-collapse monitor) ───────────
+            # With anchor-cls removed, scene-WTA is the only diversity mechanism;
+            # a healthy run keeps several modes in play. One mode taking >80% of
+            # scenes signals collapse (mitigation: scene-level entropy regulariser).
+            _hist = mode_hist / mode_hist.sum().clamp(min=1)
+            _hstr = " ".join(f"m{j}:{100*v:.1f}%" for j, v in enumerate(_hist.tolist()))
+            logger.print(f"[Modes] ep {epoch+1} | oracle-winner usage: {_hstr}")
+            for j in range(args.num_modes):
+                logger.add_scalar(f"modes/winner_share_{j}", _hist[j].item(), it=epoch)
 
             cb     = raw_cb.traj_decoder.codebook
             anc    = cb.anchors.float().cpu()                       # [K, 2]
