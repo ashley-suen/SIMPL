@@ -25,13 +25,21 @@ class AV2HybridDataset(Dataset):
                  obs_len=50,
                  max_agents=6,
                  max_lanes=20,
-                 max_text_len=256):
+                 max_text_len=256,
+                 max_text_agents=6):
 
         self.data_dir     = data_dir
         self.obs_len      = obs_len
         self.max_agents   = max_agents
         self.max_lanes    = max_lanes
         self.max_text_len = max_text_len
+        # Number of surrounding agents ENUMERATED IN TEXT (top-influence). Decoupled
+        # from max_agents (the NUMERICAL channel): the numerical encoder handles all
+        # max_agents agents, while the text only describes the few most influential
+        # ones. Enumerating every parked car in text is DPI-redundant (already in the
+        # numerical channel) and just bloats the LLM sequence. Default 6 preserves the
+        # pre-exp13 behaviour.
+        self.max_text_agents = max_text_agents
 
         self.file_list = (
             glob.glob(os.path.join(data_dir, "*.pkl")) or
@@ -296,11 +304,16 @@ class AV2HybridDataset(Dataset):
                  f"Speed: {fk['first_speed']:.1f}→{fk['last_speed']:.1f}m/s "
                  f"({speed_trend}) | Heading: {heading_desc}\n\n")
 
-        # Surrounding agents context (up to max_agents-1 neighbors)
+        # neighbor_ids for the NUMERICAL channel: up to max_agents-1 closest/most
+        # influential neighbors (fills the numerical agent slots).
         selected = neighbors_info[:self.max_agents - 1]
-        if selected:
+        # Surrounding agents context in TEXT: only the top-influence few (decoupled
+        # from the numerical channel — see max_text_agents). The rest are carried by
+        # the numerical encoder and would be DPI-redundant if listed here.
+        text_neighbors = neighbors_info[:max(0, self.max_text_agents - 1)]
+        if text_neighbors:
             text += "[SURROUNDING AGENTS CONTEXT]\n"
-            for k, n in enumerate(selected, 1):
+            for k, n in enumerate(text_neighbors, 1):
                 sr_parts     = n["semantic_role"].split(" | ")
                 position_str = sr_parts[0].replace("pos(t=49): ", "") if sr_parts else "unknown"
                 interact_str = sr_parts[2].replace("interaction: ", "") if len(sr_parts) > 2 else "unknown"

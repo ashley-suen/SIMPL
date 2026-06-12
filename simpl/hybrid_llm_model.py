@@ -230,7 +230,6 @@ class AnchorCodebook(nn.Module):
 
 
 # ── MLP Trajectory Decoder ────────────────────────────────────────────────────
-
 class MLPDecoder(nn.Module):
     """
     Feedforward multi-modal trajectory decoder — Scenario-Query Joint variant.
@@ -364,7 +363,6 @@ class MLPDecoder(nn.Module):
 
 
 # ── Level-k Interaction Decoder ───────────────────────────────────────────────
-
 class InteractionDecoder(nn.Module):
     """
     Level-k Interaction Decoder — aligned with GameFormer's original design.
@@ -543,7 +541,6 @@ class LaneCrossAttn(nn.Module):
 
 
 # ── Main Model ────────────────────────────────────────────────────────────────
-
 class HybridLLMPredictor(nn.Module):
     """
     Hybrid Token LLM Predictor with Level-k Interaction Decoding.

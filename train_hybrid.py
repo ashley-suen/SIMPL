@@ -70,6 +70,10 @@ def parse_arguments():
                         help="Max tokens for the semantic text portion (no coord steps)")
     parser.add_argument("--max_agents",   type=int, default=6)
     parser.add_argument("--max_lanes",    type=int, default=20)
+    parser.add_argument("--max_text_agents", type=int, default=6,
+                        help="# surrounding agents enumerated IN TEXT (top-influence). "
+                             "Decoupled from max_agents (numerical channel) to keep the "
+                             "LLM sequence short; the rest are handled numerically.")
 
     # Training
     parser.add_argument("--train_batch_size",   type=int, default=4)
@@ -254,11 +258,11 @@ def main():
     train_set = AV2HybridDataset(
         train_dir, tokenizer_name=args.model_name,
         max_agents=args.max_agents, max_lanes=args.max_lanes,
-        max_text_len=args.max_text_len)
+        max_text_len=args.max_text_len, max_text_agents=args.max_text_agents)
     val_set   = AV2HybridDataset(
         val_dir, tokenizer_name=args.model_name,
         max_agents=args.max_agents, max_lanes=args.max_lanes,
-        max_text_len=args.max_text_len)
+        max_text_len=args.max_text_len, max_text_agents=args.max_text_agents)
 
     full_train_set  = train_set
     full_train_size = len(train_set)
@@ -610,6 +614,14 @@ def main():
                 min_ade = scene_ade.min(dim=1).values.mean()
                 min_fde = scene_fde.min(dim=1).values.mean()
 
+                # ── FOCAL-agent minADE/minFDE (standard AV2 single-agent metric) ──
+                # Agent 0 is the focal agent (dataset order: [focal(0), neighbors]).
+                # Each metric picks the focal's OWN best mode (per-agent oracle),
+                # which is the leaderboard-comparable number — strictly easier than
+                # the joint scene-level metric above.
+                focal_ade = per_mode_ade[:, 0, :].min(dim=1).values.mean()
+                focal_fde = per_mode_fde[:, 0, :].min(dim=1).values.mean()
+
                 # ── brierMinFDE: minFDE + (1 - p_best)^2, p_best = predicted prob
                 #    of the oracle min-FDE mode. Scene-level confidence is the
                 #    masked mean of per-agent logits over scored agents.
@@ -623,7 +635,9 @@ def main():
                                              minlength=args.num_modes).float()
 
                 ade_meter.update({"minADE": min_ade.item(), "minFDE": min_fde.item(),
-                                  "brierMinFDE": brier_fde.item()})
+                                  "brierMinFDE": brier_fde.item(),
+                                  "focalMinADE": focal_ade.item(),
+                                  "focalMinFDE": focal_fde.item()})
                 if is_main:
                     pbar_v.set_postfix({
                         "loss":   f"{val_meter.metrics['loss'].avg:.4f}",
@@ -644,12 +658,15 @@ def main():
             ade_meter.metrics["minADE"].avg,
             ade_meter.metrics["minFDE"].avg,
             ade_meter.metrics["brierMinFDE"].avg,
+            ade_meter.metrics["focalMinADE"].avg,
+            ade_meter.metrics["focalMinFDE"].avg,
         ] + [val_meter.metrics[k].avg for k in extra_keys]
         local_tensor  = torch.tensor(local_vals, dtype=torch.float64, device=device)
         global_tensor = distributed_mean(local_tensor)          # collective on every rank
         global_vals   = global_tensor.tolist()
-        val_loss_avg, min_ade_avg, min_fde_avg, brier_fde_avg = global_vals[:4]
-        extra_avgs    = dict(zip(extra_keys, global_vals[4:]))
+        (val_loss_avg, min_ade_avg, min_fde_avg, brier_fde_avg,
+         focal_ade_avg, focal_fde_avg) = global_vals[:6]
+        extra_avgs    = dict(zip(extra_keys, global_vals[6:]))
         dist.all_reduce(mode_hist)                              # collective on every rank
 
         if is_main:
@@ -659,10 +676,18 @@ def main():
                 f"brierMinFDE: {brier_fde_avg:.4f} | "
                 f"time: {(time.time()-val_start)/60:.3f} mins"
             )
+            logger.print(
+                f"[Validation-Focal] ep {epoch+1} | "
+                f"focalMinADE: {focal_ade_avg:.4f} m | "
+                f"focalMinFDE: {focal_fde_avg:.4f} m  "
+                f"(agent-0 per-agent oracle, leaderboard-comparable)"
+            )
             logger.add_scalar("val/loss",        val_loss_avg,  it=epoch)
             logger.add_scalar("val/minADE",      min_ade_avg,   it=epoch)
             logger.add_scalar("val/minFDE",      min_fde_avg,   it=epoch)
             logger.add_scalar("val/brierMinFDE", brier_fde_avg, it=epoch)
+            logger.add_scalar("val/focalMinADE", focal_ade_avg, it=epoch)
+            logger.add_scalar("val/focalMinFDE", focal_fde_avg, it=epoch)
             for k, v in extra_avgs.items():
                 logger.add_scalar(f"val/{k}", v, it=epoch)
 
