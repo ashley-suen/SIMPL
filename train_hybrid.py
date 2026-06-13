@@ -89,6 +89,11 @@ def parse_arguments():
     # Model
     parser.add_argument("--model_name",  type=str, default="Qwen/Qwen3-0.6B-Base")
     parser.add_argument("--num_modes",     type=int, default=6)
+    parser.add_argument("--rgsf_layers", type=int, default=0,
+                        help="Relative-Geometric Scene Fusion layers (exp15). "
+                             "0 = disabled (pre-exp15 behaviour).")
+    parser.add_argument("--rgsf_dim",    type=int, default=256,
+                        help="RGSF internal (down-projected) fusion dimension.")
     parser.add_argument("--n_bezier_ctrl", type=int, default=6,
                         help="Number of Bézier control points per mode (degree = n-1). "
                              "6 control points (degree 5) covers straight/lane-change/turn.")
@@ -311,6 +316,7 @@ def main():
             n_levels=args.n_levels,
             max_agents=args.max_agents, max_lanes=args.max_lanes,
             num_modes=args.num_modes, n_bezier_ctrl=args.n_bezier_ctrl,
+            rgsf_layers=args.rgsf_layers, rgsf_dim=args.rgsf_dim,
             use_flash_attn=use_flash_attn, dtype=torch.bfloat16)
         model = model.to(device).to(torch.bfloat16)
         if os.path.exists(lock_file): os.remove(lock_file)
@@ -328,6 +334,7 @@ def main():
             n_levels=args.n_levels,
             max_agents=args.max_agents, max_lanes=args.max_lanes,
             num_modes=args.num_modes, n_bezier_ctrl=args.n_bezier_ctrl,
+            rgsf_layers=args.rgsf_layers, rgsf_dim=args.rgsf_dim,
             use_flash_attn=use_flash_attn, dtype=torch.bfloat16)
         model = model.to(device).to(torch.bfloat16)
 
@@ -610,40 +617,66 @@ def main():
                 scene_fde    = (per_mode_fde * scored.unsqueeze(-1)).sum(dim=1) \
                                / agent_cnt.unsqueeze(-1)                        # [B, K]
 
-                # pick the single best joint mode per scene, then average over scenes
-                min_ade = scene_ade.min(dim=1).values.mean()
-                min_fde = scene_fde.min(dim=1).values.mean()
+                MISS = 2.0   # AV2 miss threshold: FDE > 2.0 m counts as a miss
 
-                # ── FOCAL-agent minADE/minFDE (standard AV2 single-agent metric) ──
-                # Agent 0 is the focal agent (dataset order: [focal(0), neighbors]).
-                # Each metric picks the focal's OWN best mode (per-agent oracle),
-                # which is the leaderboard-comparable number — strictly easier than
-                # the joint scene-level metric above.
-                focal_ade = per_mode_ade[:, 0, :].min(dim=1).values.mean()
-                focal_fde = per_mode_fde[:, 0, :].min(dim=1).values.mean()
-
-                # ── brierMinFDE: minFDE + (1 - p_best)^2, p_best = predicted prob
-                #    of the oracle min-FDE mode. Scene-level confidence is the
-                #    masked mean of per-agent logits over scored agents.
+                # ── MULTI-AGENT (multi-world) metrics: ONE shared best world per ──
+                # scene, selected by avg FDE over scored actors (AV2 multi-agent
+                # protocol); all multi-agent metrics are reported in that world.
                 scene_logit = (all_scores[-1].float() * scored.unsqueeze(-1)).sum(dim=1) \
                               / agent_cnt.unsqueeze(-1)                        # [B, K]
                 scene_prob  = torch.softmax(scene_logit, dim=-1)              # [B, K]
-                best_fde_idx = scene_fde.argmin(dim=1)                        # [B]
-                p_best      = scene_prob.gather(1, best_fde_idx.unsqueeze(1)).squeeze(1)  # [B]
-                brier_fde   = (scene_fde.min(dim=1).values + (1.0 - p_best) ** 2).mean()
-                mode_hist  += torch.bincount(best_fde_idx,
-                                             minlength=args.num_modes).float()
+                best        = scene_fde.argmin(dim=1)                         # [B] shared world
+                mode_hist  += torch.bincount(best, minlength=args.num_modes).float()
 
-                ade_meter.update({"minADE": min_ade.item(), "minFDE": min_fde.item(),
-                                  "brierMinFDE": brier_fde.item(),
-                                  "focalMinADE": focal_ade.item(),
-                                  "focalMinFDE": focal_fde.item()})
+                avg_min_fde = scene_fde.gather(1, best.unsqueeze(1)).squeeze(1)        # [B]
+                avg_min_ade = scene_ade.gather(1, best.unsqueeze(1)).squeeze(1).mean()
+                p_best      = scene_prob.gather(1, best.unsqueeze(1)).squeeze(1)        # [B]
+                avg_brier_fde = (avg_min_fde + (1.0 - p_best) ** 2).mean()
+                avg_min_fde = avg_min_fde.mean()
+                # actorMR: fraction of scored actors with FDE > 2 m in the chosen world
+                fde_win  = per_mode_fde.gather(
+                    2, best[:, None, None].expand(-1, per_mode_fde.shape[1], 1)).squeeze(2)  # [B,N]
+                actor_mr = ((fde_win > MISS).float() * scored).sum() / scored.sum().clamp(min=1)
+                # actorCR: collision rate among scored actors in the chosen world.
+                # Centroid-distance approximation (no bbox dims available): two actors
+                # collide if their predicted centroids are < COLLISION m apart at any
+                # commonly-valid future step. Value is indicative, not the bbox-exact AV2 CR.
+                COLLISION = 2.0
+                Tf = pred_abs.shape[3]
+                pred_win = pred_abs.gather(
+                    2, best[:, None, None, None, None].expand(-1, pred_abs.shape[1], 1, Tf, 2)
+                ).squeeze(2)                                                   # [B, N, T, 2]
+                pdist = (pred_win[:, :, None] - pred_win[:, None, :]).norm(dim=-1)   # [B,N,N,T]
+                vt    = (gt_masks_f & train_m.unsqueeze(-1))                   # [B, N, T] bool
+                pair_v = vt[:, :, None] & vt[:, None, :]                       # [B,N,N,T]
+                eye    = torch.eye(pred_win.shape[1], device=device, dtype=torch.bool)
+                pair_v = pair_v & ~eye[None, :, :, None]                       # exclude self
+                actor_collide = ((pdist < COLLISION) & pair_v).any(dim=(2, 3))  # [B, N]
+                actor_cr = (actor_collide.float() * scored).sum() / scored.sum().clamp(min=1)
+
+                # ── FOCAL-agent metrics (agent 0; AV2 single-agent leaderboard, K=6) ──
+                f_ade_pm, f_fde_pm = per_mode_ade[:, 0, :], per_mode_fde[:, 0, :]  # [B, K]
+                focal_ade = f_ade_pm.min(dim=1).values.mean()
+                focal_fde = f_fde_pm.min(dim=1).values.mean()
+                focal_mr  = (f_fde_pm.min(dim=1).values > MISS).float().mean()
+                f_logit = all_scores[-1][:, 0, :].float()
+                f_prob  = torch.softmax(f_logit, dim=-1)
+                f_best  = f_fde_pm.argmin(dim=1)
+                f_pbest = f_prob.gather(1, f_best.unsqueeze(1)).squeeze(1)
+                focal_bfde = (f_fde_pm.min(dim=1).values + (1.0 - f_pbest) ** 2).mean()
+
+                ade_meter.update({
+                    "avgMinADE": avg_min_ade.item(), "avgMinFDE": avg_min_fde.item(),
+                    "avgBrierMinFDE": avg_brier_fde.item(), "actorMR": actor_mr.item(),
+                    "actorCR": actor_cr.item(),
+                    "focalMinADE": focal_ade.item(), "focalMinFDE": focal_fde.item(),
+                    "focalBrierFDE": focal_bfde.item(), "focalMR": focal_mr.item()})
                 if is_main:
                     pbar_v.set_postfix({
-                        "loss":   f"{val_meter.metrics['loss'].avg:.4f}",
-                        "minADE": f"{ade_meter.metrics['minADE'].avg:.4f}",
-                        "minFDE": f"{ade_meter.metrics['minFDE'].avg:.4f}",
-                        "bFDE":   f"{ade_meter.metrics['brierMinFDE'].avg:.4f}",
+                        "loss":      f"{val_meter.metrics['loss'].avg:.4f}",
+                        "avgMinADE": f"{ade_meter.metrics['avgMinADE'].avg:.4f}",
+                        "avgMinFDE": f"{ade_meter.metrics['avgMinFDE'].avg:.4f}",
+                        "actorMR":   f"{ade_meter.metrics['actorMR'].avg:.4f}",
                     })
 
         pbar_v.close()
@@ -652,42 +685,38 @@ def main():
         # CRITICAL: distributed_mean() calls dist.all_gather() which is a collective
         # op — every rank MUST call it the same number of times, or DDP deadlocks.
         # All per-level loss keys are bundled here (NOT inside `if is_main`).
+        # Ordered metric keys (extend here to add metrics — aggregation is generic).
+        ade_keys = ["avgMinADE", "avgMinFDE", "avgBrierMinFDE", "actorMR", "actorCR",
+                    "focalMinADE", "focalMinFDE", "focalBrierFDE", "focalMR"]
         extra_keys  = [k for k in val_meter.metrics if k != "loss"]
-        local_vals  = [
-            val_meter.metrics["loss"].avg,
-            ade_meter.metrics["minADE"].avg,
-            ade_meter.metrics["minFDE"].avg,
-            ade_meter.metrics["brierMinFDE"].avg,
-            ade_meter.metrics["focalMinADE"].avg,
-            ade_meter.metrics["focalMinFDE"].avg,
-        ] + [val_meter.metrics[k].avg for k in extra_keys]
+        local_vals  = ([val_meter.metrics["loss"].avg]
+                       + [ade_meter.metrics[k].avg for k in ade_keys]
+                       + [val_meter.metrics[k].avg for k in extra_keys])
         local_tensor  = torch.tensor(local_vals, dtype=torch.float64, device=device)
         global_tensor = distributed_mean(local_tensor)          # collective on every rank
         global_vals   = global_tensor.tolist()
-        (val_loss_avg, min_ade_avg, min_fde_avg, brier_fde_avg,
-         focal_ade_avg, focal_fde_avg) = global_vals[:6]
-        extra_avgs    = dict(zip(extra_keys, global_vals[6:]))
+        val_loss_avg  = global_vals[0]
+        ade_avgs      = dict(zip(ade_keys, global_vals[1:1 + len(ade_keys)]))
+        extra_avgs    = dict(zip(extra_keys, global_vals[1 + len(ade_keys):]))
+        min_ade_avg   = ade_avgs["avgMinADE"]   # drives best-ckpt / early-stop (multi-agent)
         dist.all_reduce(mode_hist)                              # collective on every rank
 
         if is_main:
             logger.print(
-                f"[Validation] ep {epoch+1} | loss: {val_loss_avg:.4f} | "
-                f"minADE: {min_ade_avg:.4f} m | minFDE: {min_fde_avg:.4f} m | "
-                f"brierMinFDE: {brier_fde_avg:.4f} | "
-                f"time: {(time.time()-val_start)/60:.3f} mins"
+                f"[Validation-MultiAgent] ep {epoch+1} | loss: {val_loss_avg:.4f} | "
+                f"avgMinADE6: {ade_avgs['avgMinADE']:.4f} m | avgMinFDE6: {ade_avgs['avgMinFDE']:.4f} m | "
+                f"avgBrierMinFDE6: {ade_avgs['avgBrierMinFDE']:.4f} | actorMR6: {ade_avgs['actorMR']:.4f} | "
+                f"actorCR6: {ade_avgs['actorCR']:.4f} | time: {(time.time()-val_start)/60:.3f} mins"
             )
             logger.print(
                 f"[Validation-Focal] ep {epoch+1} | "
-                f"focalMinADE: {focal_ade_avg:.4f} m | "
-                f"focalMinFDE: {focal_fde_avg:.4f} m  "
-                f"(agent-0 per-agent oracle, leaderboard-comparable)"
+                f"minADE6: {ade_avgs['focalMinADE']:.4f} m | minFDE6: {ade_avgs['focalMinFDE']:.4f} m | "
+                f"b-minFDE6: {ade_avgs['focalBrierFDE']:.4f} | MR6: {ade_avgs['focalMR']:.4f}  "
+                f"(agent-0, single-agent leaderboard-comparable)"
             )
-            logger.add_scalar("val/loss",        val_loss_avg,  it=epoch)
-            logger.add_scalar("val/minADE",      min_ade_avg,   it=epoch)
-            logger.add_scalar("val/minFDE",      min_fde_avg,   it=epoch)
-            logger.add_scalar("val/brierMinFDE", brier_fde_avg, it=epoch)
-            logger.add_scalar("val/focalMinADE", focal_ade_avg, it=epoch)
-            logger.add_scalar("val/focalMinFDE", focal_fde_avg, it=epoch)
+            logger.add_scalar("val/loss", val_loss_avg, it=epoch)
+            for k, v in ade_avgs.items():
+                logger.add_scalar(f"val/{k}", v, it=epoch)
             for k, v in extra_avgs.items():
                 logger.add_scalar(f"val/{k}", v, it=epoch)
 
@@ -704,12 +733,15 @@ def main():
             _corr = getattr(raw_cb, "diag_corr_ratio", float("nan"))
             _lane = getattr(raw_cb, "diag_lane_ratio", float("nan"))
             _scn  = getattr(raw_cb, "diag_scn_ratio",  float("nan"))
+            _rgsf = getattr(raw_cb, "diag_rgsf_ratio", float("nan"))
             logger.print(f"[Branch] ep {epoch+1} | LLM corr/enc: {_corr:.4f} "
                          f"| lane_cross/input: {_lane:.4f} "
-                         f"| scn_q/base_q: {_scn:.4f}")
+                         f"| scn_q/base_q: {_scn:.4f} "
+                         f"| rgsf/enc: {_rgsf:.4f}")
             logger.add_scalar("diag/llm_corr_ratio", _corr, it=epoch)
             logger.add_scalar("diag/lane_ratio",     _lane, it=epoch)
             logger.add_scalar("diag/scn_ratio",      _scn,  it=epoch)
+            logger.add_scalar("diag/rgsf_ratio",     _rgsf, it=epoch)
 
             # ── Winner-mode usage histogram (mode-collapse monitor) ───────────
             # With anchor-cls removed, scene-WTA is the only diversity mechanism;
@@ -745,7 +777,7 @@ def main():
             patience_ctr  = 0
             if is_main:
                 logger.print(
-                    f"  >> minADE improved by {improvement:.4f} m → {best_minADE:.4f} m; "
+                    f"  >> avgMinADE improved by {improvement:.4f} m → {best_minADE:.4f} m; "
                     f"saving best checkpoint...")
                 safe_save(logger, model, optimizer, epoch, args.ckpt_dir, best_ckpt)
         else:
@@ -754,7 +786,7 @@ def main():
                             if args.early_stop_patience > 0 else "")
             if is_main:
                 logger.print(
-                    f"  -- No minADE improvement (best={best_minADE:.4f} m, "
+                    f"  -- No avgMinADE improvement (best={best_minADE:.4f} m, "
                     f"current={min_ade_avg:.4f} m){patience_str}")
 
         if args.early_stop_patience > 0 and patience_ctr >= args.early_stop_patience:

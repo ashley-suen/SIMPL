@@ -74,6 +74,11 @@ def parse_arguments():
     parser.add_argument("--model_name",    type=str, default="Qwen/Qwen3-0.6B-Base")
     parser.add_argument("--num_modes",     type=int, default=6)
     parser.add_argument("--n_levels",      type=int, default=2)
+    parser.add_argument("--max_text_agents", type=int, default=6,
+                        help="# surrounding agents enumerated in text (decoupled from max_agents)")
+    parser.add_argument("--rgsf_layers", type=int, default=0,
+                        help="Relative-Geometric Scene Fusion layers (exp15); 0=disabled")
+    parser.add_argument("--rgsf_dim",    type=int, default=256)
     parser.add_argument("--n_bezier_ctrl", type=int, default=6,
                         help="Number of Bezier control points per mode (degree K-1).")
 
@@ -142,12 +147,12 @@ def main():
         os.path.join(args.features_dir, "train"),
         tokenizer_name=args.model_name,
         max_agents=args.max_agents, max_lanes=args.max_lanes,
-        max_text_len=args.max_text_len)
+        max_text_len=args.max_text_len, max_text_agents=args.max_text_agents)
     val_set = AV2HybridDataset(
         os.path.join(args.features_dir, "val"),
         tokenizer_name=args.model_name,
         max_agents=args.max_agents, max_lanes=args.max_lanes,
-        max_text_len=args.max_text_len)
+        max_text_len=args.max_text_len, max_text_agents=args.max_text_agents)
 
     if args.max_train_samples > 0:
         train_set = torch.utils.data.Subset(
@@ -175,6 +180,7 @@ def main():
         n_levels=args.n_levels,
         max_agents=args.max_agents, max_lanes=args.max_lanes,
         num_modes=args.num_modes, n_bezier_ctrl=args.n_bezier_ctrl,
+        rgsf_layers=args.rgsf_layers, rgsf_dim=args.rgsf_dim,
         use_flash_attn=False,       # disabled for local compatibility
         dtype=torch.bfloat16)
     model = model.to(device).to(torch.bfloat16)

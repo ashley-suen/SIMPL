@@ -540,6 +540,120 @@ class LaneCrossAttn(nn.Module):
         return self.norm(h_agents + self.out(ctx))         # zero-init residual
 
 
+# ── Relative-Geometric Scene Fusion (RGSF) ─────────────────────────────────────
+# Synthesis of SIMPL (RPE channels), QCNet (Fourier encoding of continuous geometry),
+# MTR/VectorNet (joint [agents;lanes] global self-attention; geometry injected into
+# attention). Avoids SIMPL's N×N×H memory-SFT (OOM at H=1024) by injecting the
+# relative-positional encoding as an additive ATTENTION BIAS ([B,heads,T,T], ~MB)
+# instead of a dense N×N×d_model memory tensor. Runs at a reduced dim d_f (256) via
+# down/up projection; up-proj is zero-init so RGSF starts as identity and activates
+# gradually (same pattern as llm_correction_proj / lane_cross / InteractionDecoder).
+
+def _cos_sin_between(v1, v2):
+    """cos/sin of the signed angle from v1 to v2; broadcastable [..., 2]."""
+    denom = (v1.norm(dim=-1) * v2.norm(dim=-1)).clamp(min=1e-10)
+    cos = (v1[..., 0] * v2[..., 0] + v1[..., 1] * v2[..., 1]) / denom
+    sin = (v1[..., 0] * v2[..., 1] - v1[..., 1] * v2[..., 0]) / denom
+    return cos, sin
+
+
+def compute_rpe(ctrs, vecs, radius=100.0):
+    """SIMPL-style relative positional encoding, batched.
+
+    ctrs, vecs: [B, T, 2]  (token centers and orientation vectors)
+    returns rpe [B, T, T, 5] = [cos(rel-orient), sin(rel-orient),
+                                cos(bearing), sin(bearing), scaled-distance]
+    All quantities are rotation/translation invariant.
+    """
+    dpos = ctrs.unsqueeze(1) - ctrs.unsqueeze(2)              # [B,T,T,2]
+    d    = dpos.norm(dim=-1)                                  # [B,T,T]
+    vi   = vecs.unsqueeze(2)                                  # [B,T,1,2]
+    vj   = vecs.unsqueeze(1)                                  # [B,1,T,2]
+    cos1, sin1 = _cos_sin_between(vi, vj)                     # relative orientation
+    cos2, sin2 = _cos_sin_between(vi, dpos)                   # bearing
+    return torch.stack([cos1, sin1, cos2, sin2, d * 2.0 / radius], dim=-1)
+
+
+class _FourierBias(nn.Module):
+    """Encode the 5-channel RPE with QCNet-style Fourier features, then a per-layer
+    MLP maps it to an additive attention bias [B, n_head, T, T]."""
+    def __init__(self, in_ch=5, num_freq=8, n_head=8, n_layers=3, hidden=64):
+        super().__init__()
+        self.freqs = nn.Parameter(torch.randn(in_ch, num_freq))
+        feat_dim   = in_ch * (2 * num_freq + 1)
+        self.mlps  = nn.ModuleList([
+            nn.Sequential(nn.Linear(feat_dim, hidden), nn.LayerNorm(hidden),
+                          nn.ReLU(inplace=True), nn.Linear(hidden, n_head))
+            for _ in range(n_layers)])
+
+    def encode(self, rpe):
+        # rpe: [B,T,T,5] -> [B,T,T,5*(2F+1)]
+        x = rpe.unsqueeze(-1) * self.freqs * (2 * math.pi)       # [B,T,T,5,F]
+        x = torch.cat([x.cos(), x.sin(), rpe.unsqueeze(-1)], dim=-1)
+        return x.flatten(-2)
+
+    def bias(self, feat, layer):
+        # feat: [B,T,T,feat_dim] -> [B, n_head, T, T]
+        return self.mlps[layer](feat).permute(0, 3, 1, 2)
+
+
+class _RGSFLayer(nn.Module):
+    """Pre-norm self-attention (with RPE bias as attn_mask) + FFN."""
+    def __init__(self, d, n_head=8, dropout=0.1):
+        super().__init__()
+        self.n_head = n_head
+        self.norm1  = nn.LayerNorm(d)
+        self.attn   = nn.MultiheadAttention(d, n_head, dropout=dropout, batch_first=True)
+        self.norm2  = nn.LayerNorm(d)
+        self.ffn    = nn.Sequential(nn.Linear(d, d * 2), nn.GELU(), nn.Linear(d * 2, d))
+
+    def forward(self, x, bias, key_pad):
+        B, T, _ = x.shape
+        h = self.norm1(x)
+        # Merge padding into the float additive bias (avoids the deprecated mix of a
+        # float attn_mask with a bool key_padding_mask). Padded KEYS get -inf so no
+        # token attends to them; every query keeps ≥1 valid key (focal/real lanes),
+        # so no fully-masked row → no NaN.
+        mask = bias
+        if key_pad is not None:
+            pad = torch.zeros(B, 1, 1, T, device=x.device, dtype=mask.dtype)
+            pad = pad.masked_fill(key_pad[:, None, None, :], float("-inf"))
+            mask = mask + pad
+        attn_mask = mask.reshape(B * self.n_head, T, T).to(h.dtype)
+        a, _ = self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)
+        x = x + a
+        return x + self.ffn(self.norm2(x))
+
+
+class RGSF(nn.Module):
+    """Relative-Geometric Scene Fusion over [agents; lanes].
+
+    Joint self-attention with relative-positional attention bias, at reduced dim d_f.
+    Zero-init up-projection → identity at init. Gradient to LaneEncoder flows through
+    the agent↔lane attention (subsumes lane_cross's gradient-path role).
+    """
+    def __init__(self, H, d_f=256, n_layers=3, n_head=8, num_freq=8):
+        super().__init__()
+        self.down = nn.Linear(H, d_f)
+        self.up   = nn.Linear(d_f, H)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+        self.fourier = _FourierBias(5, num_freq, n_head, n_layers)
+        self.layers  = nn.ModuleList([_RGSFLayer(d_f, n_head) for _ in range(n_layers)])
+
+    def forward(self, agent_emb, lane_emb, ctrs, vecs, valid):
+        """agent_emb [B,N,H], lane_emb [B,L,H], ctrs/vecs [B,T,2], valid [B,T] bool."""
+        N = agent_emb.shape[1]
+        tok  = torch.cat([agent_emb, lane_emb], dim=1)           # [B,T,H]
+        x    = self.down(tok)                                    # [B,T,d_f]
+        feat = self.fourier.encode(compute_rpe(ctrs, vecs))      # [B,T,T,*]
+        key_pad = ~valid                                         # [B,T]
+        for i, lyr in enumerate(self.layers):
+            x = lyr(x, self.fourier.bias(feat, i), key_pad)
+        fused = tok + self.up(x)                                 # zero-init → identity start
+        return fused[:, :N], fused[:, N:]
+
+
 # ── Main Model ────────────────────────────────────────────────────────────────
 class HybridLLMPredictor(nn.Module):
     """
@@ -566,6 +680,8 @@ class HybridLLMPredictor(nn.Module):
                  n_bezier_ctrl=6,
                  gru_hidden=256,
                  gru_layers=2,
+                 rgsf_layers=0,
+                 rgsf_dim=256,
                  use_flash_attn=True,
                  dtype=torch.bfloat16,
                  device=None):
@@ -640,8 +756,16 @@ class HybridLLMPredictor(nn.Module):
         # Normalize combined hidden states before decoding
         self.pre_decoder_norm = nn.LayerNorm(H)
 
-        # Explicit agent→lane cross-attention (gives LaneEncoder a direct gradient path)
+        # Explicit agent→lane cross-attention (gives LaneEncoder a direct gradient path).
+        # When RGSF is enabled it subsumes this (joint agent↔lane fusion), so lane_cross
+        # is skipped in forward — kept here for checkpoint compat / rgsf_layers=0 fallback.
         self.lane_cross = LaneCrossAttn(hidden=H, dim=128, nhead=4)
+
+        # Relative-Geometric Scene Fusion (exp15): RPE-bias joint fusion over
+        # [agents; lanes] BEFORE the LLM, so the LLM (and decoder) see spatially
+        # structured tokens. rgsf_layers=0 disables it (pre-exp15 behaviour).
+        self.rgsf = RGSF(H, d_f=rgsf_dim, n_layers=rgsf_layers) if rgsf_layers > 0 else None
+        self.diag_rgsf_ratio = 0.0   # ‖RGSF delta‖ / ‖agent_emb‖ (no grad)
 
         self.interaction = InteractionDecoder(
             traj_decoder=self.traj_decoder, hidden_dim=H,
@@ -739,6 +863,25 @@ class HybridLLMPredictor(nn.Module):
                                   lane_features.shape[3])
         ).reshape(B, L, H)                                             # [B, L, H]
 
+        # ── Relative-Geometric Scene Fusion (exp15) ───────────────────────────
+        # Fuse [agents; lanes] with RPE-biased joint attention BEFORE the LLM, so
+        # the LLM and decoder both see spatially structured tokens. Gradient to the
+        # LaneEncoder flows through the agent↔lane attention (subsumes lane_cross).
+        if self.rgsf is not None:
+            agent_ctrs = gt_anchor.to(agent_emb.dtype)                # [B,N,2] last valid pos
+            agent_vecs = agent_features[:, :, -1, 4:6].to(agent_emb.dtype)  # (cosθ,sinθ)
+            lane_ctrs  = lane_features[..., 0:2].mean(dim=2).to(agent_emb.dtype)  # [B,L,2]
+            lane_vecs  = lane_features[..., 2:4].mean(dim=2).to(agent_emb.dtype)  # [B,L,2]
+            ctrs  = torch.cat([agent_ctrs, lane_ctrs], dim=1)         # [B,T,2]
+            vecs  = torch.cat([agent_vecs, lane_vecs], dim=1)         # [B,T,2]
+            valid = torch.cat([agent_valid, lane_valid], dim=1)       # [B,T]
+            a_fused, lane_emb = self.rgsf(agent_emb, lane_emb, ctrs, vecs, valid)
+            with torch.no_grad():
+                vm = agent_valid.unsqueeze(-1).float()
+                self.diag_rgsf_ratio = (((a_fused - agent_emb) * vm).norm()
+                                        / (agent_emb * vm).norm().clamp(min=1e-6)).item()
+            agent_emb = a_fused
+
         # ── LLM forward with DETACHED encoder outputs ─────────────────────────
         # Detaching prevents gradient from flowing back through 28 transformer
         # layers to the encoders (the primary cause of gradient explosion).
@@ -767,9 +910,14 @@ class HybridLLMPredictor(nn.Module):
         # Norm first, then mask: LayerNorm of a zero vector yields bias (non-zero
         # after training), so masking must happen AFTER norm to keep padding agents at 0.
         h_pre = self.pre_decoder_norm(agent_emb + h_correction)
-        # Explicit agent→lane cross-attention (uses NON-detached lane_emb so the
-        # LaneEncoder receives a direct gradient). Zero-init residual → identity start.
-        h_post = self.lane_cross(h_pre, lane_emb, lane_valid)
+        # Agent→lane fusion. RGSF (if enabled) already fused agent↔lane before the LLM,
+        # so lane_cross is skipped; otherwise fall back to the explicit cross-attention.
+        if self.rgsf is not None:
+            h_post = h_pre
+        else:
+            # uses NON-detached lane_emb so the LaneEncoder gets a direct gradient;
+            # zero-init residual → identity start.
+            h_post = self.lane_cross(h_pre, lane_emb, lane_valid)
         h_agents = h_post * agent_valid.unsqueeze(-1).float()
 
         # ── Branch-contribution diagnostics (no grad, valid agents only) ──────
