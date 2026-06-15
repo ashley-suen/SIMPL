@@ -26,13 +26,21 @@ class AV2HybridDataset(Dataset):
                  max_agents=6,
                  max_lanes=20,
                  max_text_len=256,
-                 max_text_agents=6):
+                 max_text_agents=6,
+                 augment=False):
 
         self.data_dir     = data_dir
         self.obs_len      = obs_len
         self.max_agents   = max_agents
         self.max_lanes    = max_lanes
         self.max_text_len = max_text_len
+        # exp16: whole-scene random-rotation augmentation (train only). Rotates every
+        # spatial quantity (positions/velocities/headings/lane dirs + GT) by a single
+        # random angle around the focal origin. Text is left unchanged: it encodes
+        # frame-invariant semantics (speeds, turn directions, relations), not absolute
+        # coordinates. The only data regulariser the model previously lacked; all of
+        # SIMPL/QCNet/MTR use it.
+        self.augment      = augment
         # Number of surrounding agents ENUMERATED IN TEXT (top-influence). Decoupled
         # from max_agents (the NUMERICAL channel): the numerical encoder handles all
         # max_agents agents, while the text only describes the few most influential
@@ -349,19 +357,22 @@ class AV2HybridDataset(Dataset):
     def _get_agent_features(self, df_row, neighbor_ids):
         """
         Returns:
-          features [max_agents, obs_len, 13]  float32
-            = (x, y, vx, vy, cos_θ, sin_θ, type_0..6)
-          valid    [max_agents]                bool
-          train_mask [max_agents]              bool
-        All coordinates in focal-agent frame (trajs_pos is already normalized).
+          features      [max_agents, obs_len, 13]  float32
+            = (x, y, vx, vy, cos_θ, sin_θ, type_0..6)  — each agent's own local frame
+          valid         [max_agents]                bool
+          train_mask    [max_agents]                bool
+          ctrs_focal    [max_agents, 2]             float32  — agent t=49 pos in focal frame
+          vecs_focal    [max_agents, 2]             float32  — agent t=49 heading in focal frame
         """
-        trajs     = df_row["TRAJS"]
-        trajs_pos = trajs["trajs_pos"]     # [N, 110, 2] already in focal frame
-        trajs_vel = trajs["trajs_vel"]     # [N, 110, 2]
-        trajs_ang = trajs["trajs_ang"]     # [N, 110]
+        trajs      = df_row["TRAJS"]
+        trajs_pos  = trajs["trajs_pos"]    # [N, 110, 2] per-agent local frame
+        trajs_vel  = trajs["trajs_vel"]    # [N, 110, 2]
+        trajs_ang  = trajs["trajs_ang"]    # [N, 110]
         trajs_type = trajs["trajs_type"]   # [N, 110, 7]  one-hot
         has_flags  = trajs["has_flags"]    # [N, 110]
         trajs_cat  = trajs["trajs_cat"]
+        trajs_ctrs = trajs["trajs_ctrs"]   # [N, 2]  agent t=49 pos in focal frame
+        trajs_vecs = trajs["trajs_vecs"]   # [N, 2]  agent t=49 heading in focal frame
 
         # Agent order: [focal(0), neighbor_ids...]
         agent_ids = [0] + list(neighbor_ids)
@@ -369,9 +380,12 @@ class AV2HybridDataset(Dataset):
         while len(agent_ids) < self.max_agents:
             agent_ids.append(-1)
 
-        features   = np.zeros((self.max_agents, self.obs_len, 13), dtype=np.float32)
-        valid      = np.zeros(self.max_agents, dtype=bool)
-        train_mask = np.zeros(self.max_agents, dtype=bool)
+        features    = np.zeros((self.max_agents, self.obs_len, 13), dtype=np.float32)
+        valid       = np.zeros(self.max_agents, dtype=bool)
+        train_mask  = np.zeros(self.max_agents, dtype=bool)
+        ctrs_focal  = np.zeros((self.max_agents, 2), dtype=np.float32)
+        vecs_focal  = np.zeros((self.max_agents, 2), dtype=np.float32)
+        vecs_focal[:, 0] = 1.0  # default: +x for padded slots
 
         for slot, ag_id in enumerate(agent_ids):
             if ag_id < 0 or ag_id >= len(trajs_cat):
@@ -395,10 +409,14 @@ class AV2HybridDataset(Dataset):
             valid[slot]      = True
             cat = str(trajs_cat[ag_id]).lower()
             train_mask[slot] = cat in ('focal', 'score')
+            ctrs_focal[slot] = trajs_ctrs[ag_id]   # focal-frame position
+            vecs_focal[slot] = trajs_vecs[ag_id]   # focal-frame heading
 
         return (torch.from_numpy(features),
                 torch.from_numpy(valid),
-                torch.from_numpy(train_mask))
+                torch.from_numpy(train_mask),
+                torch.from_numpy(ctrs_focal),
+                torch.from_numpy(vecs_focal))
 
     def _get_lane_features(self, df_row):
         """
@@ -480,9 +498,32 @@ class AV2HybridDataset(Dataset):
         row = pd.read_pickle(self.file_list[idx]).iloc[0]
 
         text_ids, text_mask, neighbor_ids = self._build_scene_text(row)
-        agent_features, agent_valid, train_mask = self._get_agent_features(row, neighbor_ids)
+        agent_features, agent_valid, train_mask, agent_ctrs, agent_vecs = \
+            self._get_agent_features(row, neighbor_ids)
         lane_features,  lane_valid              = self._get_lane_features(row)
         gt_abs, gt_anchor, gt_masks             = self._get_gt(row, neighbor_ids)
+
+        if self.augment:
+            theta = float(np.random.uniform(-np.pi, np.pi))
+            c, s  = np.cos(theta), np.sin(theta)
+            # R^T so that x_rot = x @ R^T rotates row-vectors by +theta about origin.
+            Rt = torch.tensor([[c, s], [-s, c]], dtype=torch.float32)
+            def rot(x):                      # x[..., 2] -> rotated in-place-safe
+                return x @ Rt
+            # agent_features: [N,T,13] cols 0:2 pos, 2:4 vel, 4:6 (cosθ,sinθ); 6:13 type
+            agent_features[..., 0:2] = rot(agent_features[..., 0:2])
+            agent_features[..., 2:4] = rot(agent_features[..., 2:4])
+            agent_features[..., 4:6] = rot(agent_features[..., 4:6])
+            # lane_features: [L,10,8] cols 0:2 pts, 2:4 dirs; 4:8 type/intersect
+            lane_features[..., 0:2]  = rot(lane_features[..., 0:2])
+            lane_features[..., 2:4]  = rot(lane_features[..., 2:4])
+            # GT (positions only)
+            gt_abs    = rot(gt_abs)
+            gt_anchor = rot(gt_anchor)
+            # Focal-frame agent ctrs/vecs must also rotate with the scene augmentation.
+            agent_ctrs = rot(agent_ctrs)
+            agent_vecs = rot(agent_vecs)
+            # Padded/invalid entries are zero-filled → rotation preserves zeros.
 
         return {
             # Text (semantic)
@@ -492,6 +533,8 @@ class AV2HybridDataset(Dataset):
             "agent_features":      agent_features,   # [N, T_obs, 13]
             "agent_valid":         agent_valid,       # [N]
             "train_mask":          train_mask,        # [N]
+            "agent_ctrs":          agent_ctrs,        # [N, 2]  t=49 pos in focal frame
+            "agent_vecs":          agent_vecs,        # [N, 2]  t=49 heading in focal frame
             # Numerical lane features
             "lane_features":       lane_features,     # [max_lanes, 10, 8]
             "lane_valid":          lane_valid,         # [max_lanes]

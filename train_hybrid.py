@@ -114,6 +114,12 @@ def parse_arguments():
                         help="Weight for non-winner modes in soft WTA. 0.0 (default) "
                              "= pure scene-level WTA (exp12): alpha>0 pulls all modes "
                              "toward the conditional mean, fighting mode diversity")
+    parser.add_argument("--augment",           action="store_true",
+                        help="exp16: whole-scene random-rotation augmentation (train only).")
+    parser.add_argument("--interaction_weight", type=float, default=0.0,
+                        help="exp16: weight of GameFormer Eq.4 repulsion loss (e.g. 0.1).")
+    parser.add_argument("--collision_margin",   type=float, default=2.0,
+                        help="exp16: safety margin (m) below which repulsion activates.")
     parser.add_argument("--cls_weight",        type=float, default=0.5,
                         help="Weight for scene-level mode-classification loss "
                              "(supervises per-mode confidence; needed for brierMinFDE)")
@@ -263,11 +269,13 @@ def main():
     train_set = AV2HybridDataset(
         train_dir, tokenizer_name=args.model_name,
         max_agents=args.max_agents, max_lanes=args.max_lanes,
-        max_text_len=args.max_text_len, max_text_agents=args.max_text_agents)
+        max_text_len=args.max_text_len, max_text_agents=args.max_text_agents,
+        augment=args.augment)
     val_set   = AV2HybridDataset(
         val_dir, tokenizer_name=args.model_name,
         max_agents=args.max_agents, max_lanes=args.max_lanes,
-        max_text_len=args.max_text_len, max_text_agents=args.max_text_agents)
+        max_text_len=args.max_text_len, max_text_agents=args.max_text_agents,
+        augment=False)
 
     full_train_set  = train_set
     full_train_size = len(train_set)
@@ -356,7 +364,9 @@ def main():
     # ── 3. Loss ───────────────────────────────────────────────────────────────
     loss_fn = HybridMotionLoss(n_levels=args.n_levels, device=device,
                                soft_wta_alpha=args.soft_wta_alpha,
-                               cls_weight=args.cls_weight)
+                               cls_weight=args.cls_weight,
+                               interaction_weight=args.interaction_weight,
+                               collision_margin=args.collision_margin)
     if is_main:
         n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in model.parameters())
@@ -479,13 +489,15 @@ def main():
                     ncols=120, desc=f"[Train ep {epoch+1}]")
 
         for i, data in enumerate(pbar):
-            text_ids  = data["text_input_ids"].to(device)
-            text_mask = data["text_attention_mask"].to(device)
-            ag_feat   = data["agent_features"].to(device)
-            ag_valid  = data["agent_valid"].to(device)
-            lane_feat = data["lane_features"].to(device)
-            lane_valid= data["lane_valid"].to(device)
-            gt_anchor = data["gt_anchor"].to(device)
+            text_ids   = data["text_input_ids"].to(device)
+            text_mask  = data["text_attention_mask"].to(device)
+            ag_feat    = data["agent_features"].to(device)
+            ag_valid   = data["agent_valid"].to(device)
+            ag_ctrs    = data["agent_ctrs"].to(device)
+            ag_vecs    = data["agent_vecs"].to(device)
+            lane_feat  = data["lane_features"].to(device)
+            lane_valid = data["lane_valid"].to(device)
+            gt_anchor  = data["gt_anchor"].to(device)
 
             is_last_accum = ((i + 1) % accum == 0) or ((i + 1) == iters_per_epoch)
             sync_ctx = contextlib.nullcontext() if is_last_accum else model.no_sync()
@@ -493,7 +505,8 @@ def main():
             with sync_ctx:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     all_preds, all_scores, codebook = model(text_ids, text_mask, ag_feat, ag_valid,
-                                                            lane_feat, lane_valid, gt_anchor)
+                                                            lane_feat, lane_valid, gt_anchor,
+                                                            agent_ctrs=ag_ctrs, agent_vecs=ag_vecs)
                     loss_out  = loss_fn(all_preds, data, all_scores, codebook)
 
                 (loss_out["loss"] / accum).backward()
@@ -567,17 +580,20 @@ def main():
                       ncols=120, desc=f"[Val   ep {epoch+1}]")
         with torch.no_grad():
             for data in pbar_v:
-                text_ids  = data["text_input_ids"].to(device)
-                text_mask = data["text_attention_mask"].to(device)
-                ag_feat   = data["agent_features"].to(device)
-                ag_valid  = data["agent_valid"].to(device)
-                lane_feat = data["lane_features"].to(device)
-                lane_valid= data["lane_valid"].to(device)
-                gt_anchor = data["gt_anchor"].to(device)
+                text_ids   = data["text_input_ids"].to(device)
+                text_mask  = data["text_attention_mask"].to(device)
+                ag_feat    = data["agent_features"].to(device)
+                ag_valid   = data["agent_valid"].to(device)
+                ag_ctrs    = data["agent_ctrs"].to(device)
+                ag_vecs    = data["agent_vecs"].to(device)
+                lane_feat  = data["lane_features"].to(device)
+                lane_valid = data["lane_valid"].to(device)
+                gt_anchor  = data["gt_anchor"].to(device)
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     all_preds, all_scores, codebook = model(text_ids, text_mask, ag_feat, ag_valid,
-                                                            lane_feat, lane_valid, gt_anchor)
+                                                            lane_feat, lane_valid, gt_anchor,
+                                                            agent_ctrs=ag_ctrs, agent_vecs=ag_vecs)
                     loss_out  = loss_fn(all_preds, data, all_scores, codebook)
 
                 val_meter.update({k: v.item() for k, v in loss_out.items()})
@@ -742,6 +758,18 @@ def main():
             logger.add_scalar("diag/lane_ratio",     _lane, it=epoch)
             logger.add_scalar("diag/scn_ratio",      _scn,  it=epoch)
             logger.add_scalar("diag/rgsf_ratio",     _rgsf, it=epoch)
+
+            # ── D1 negotiation diagnostics (§10.2): is the level-k game moving, ──
+            #    is it negotiating at conflicts, and is the CV prior pinning it?
+            _ldelta = getattr(raw_cb, "diag_level_delta",     float("nan"))
+            _cratio = getattr(raw_cb, "diag_conflict_ratio",  float("nan"))
+            _rprior = getattr(raw_cb, "diag_res_prior_ratio", float("nan"))
+            logger.print(f"[Game] ep {epoch+1} | level_delta: {_ldelta:.4f} m "
+                         f"| conflict/non Δ: {_cratio:.3f} "
+                         f"| res/CV-prior: {_rprior:.4f}")
+            logger.add_scalar("diag/level_delta",    _ldelta, it=epoch)
+            logger.add_scalar("diag/conflict_ratio", _cratio, it=epoch)
+            logger.add_scalar("diag/res_prior_ratio", _rprior, it=epoch)
 
             # ── Winner-mode usage histogram (mode-collapse monitor) ───────────
             # With anchor-cls removed, scene-WTA is the only diversity mechanism;

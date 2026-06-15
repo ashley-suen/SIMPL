@@ -93,6 +93,11 @@ def parse_arguments():
     #        anchor_cls removed, pure scene-WTA by default)
     parser.add_argument("--soft_wta_alpha",    type=float, default=0.0)
     parser.add_argument("--cls_weight",        type=float, default=0.5)
+    parser.add_argument("--augment",            action="store_true",
+                        help="exp16: whole-scene random-rotation augmentation (train only).")
+    parser.add_argument("--interaction_weight", type=float, default=0.0,
+                        help="exp16: weight of GameFormer Eq.4 repulsion loss (e.g. 0.1).")
+    parser.add_argument("--collision_margin",   type=float, default=2.0)
 
     # Ablation
     parser.add_argument("--scene_guidance_scale", type=float, default=1.0,
@@ -147,12 +152,14 @@ def main():
         os.path.join(args.features_dir, "train"),
         tokenizer_name=args.model_name,
         max_agents=args.max_agents, max_lanes=args.max_lanes,
-        max_text_len=args.max_text_len, max_text_agents=args.max_text_agents)
+        max_text_len=args.max_text_len, max_text_agents=args.max_text_agents,
+        augment=args.augment)
     val_set = AV2HybridDataset(
         os.path.join(args.features_dir, "val"),
         tokenizer_name=args.model_name,
         max_agents=args.max_agents, max_lanes=args.max_lanes,
-        max_text_len=args.max_text_len, max_text_agents=args.max_text_agents)
+        max_text_len=args.max_text_len, max_text_agents=args.max_text_agents,
+        augment=False)
 
     if args.max_train_samples > 0:
         train_set = torch.utils.data.Subset(
@@ -195,7 +202,9 @@ def main():
     # ── Loss ──────────────────────────────────────────────────────────────────
     loss_fn = HybridMotionLoss(n_levels=args.n_levels, device=device,
                                soft_wta_alpha=args.soft_wta_alpha,
-                               cls_weight=args.cls_weight)
+                               cls_weight=args.cls_weight,
+                               interaction_weight=args.interaction_weight,
+                               collision_margin=args.collision_margin)
     logger.print(f"Loss: HybridMotionLoss n_levels={args.n_levels} | "
                  f"level_weights={loss_fn.level_weights}")
 
@@ -372,6 +381,14 @@ def main():
         logger.print(f"[Branch] ep {epoch+1} | LLM corr/enc: {_corr:.4f} "
                      f"| lane_cross/input: {_lane:.4f} "
                      f"| scn_q/base_q: {_scn:.4f}")
+
+        # ── D1 negotiation diagnostics (§10.2) ────────────────────────────────
+        _ldelta = getattr(model, "diag_level_delta",     float("nan"))
+        _cratio = getattr(model, "diag_conflict_ratio",  float("nan"))
+        _rprior = getattr(model, "diag_res_prior_ratio", float("nan"))
+        logger.print(f"[Game] ep {epoch+1} | level_delta: {_ldelta:.4f} m "
+                     f"| conflict/non Δ: {_cratio:.3f} "
+                     f"| res/CV-prior: {_rprior:.4f}")
 
         # ── Anchor codebook diagnostics ──────────────────────────────────────
         cb      = model.traj_decoder.codebook

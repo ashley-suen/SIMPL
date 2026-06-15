@@ -50,9 +50,6 @@ class AgentEncoder(nn.Module):
     """
     MLP + MaxPool trajectory history encoder (consistent with FutureEncoder).
 
-    Replaces the previous GRU implementation to eliminate 50-step BPTT,
-    which was the other major source of gradient explosion alongside GRUDecoder.
-
     Architecture: per-frame MLP → MaxPool over T → projection
     This matches the GameFormer philosophy: use feedforward + pooling,
     not RNNs, for trajectory feature extraction.
@@ -79,7 +76,6 @@ class AgentEncoder(nn.Module):
 
 
 # ── Lane Encoder ──────────────────────────────────────────────────────────────
-
 class LaneEncoder(nn.Module):
     """
     PointNet-lite: shared MLP per point + max-pool over 10 points per polyline.
@@ -105,12 +101,10 @@ class LaneEncoder(nn.Module):
 
 
 # ── Future Encoder ────────────────────────────────────────────────────────────
-
 class FutureEncoder(nn.Module):
     """
     GameFormer-style MLP + MaxPool trajectory encoder.
 
-    Replaces GRU to eliminate 60-step BPTT gradient amplification.
     Features: (x, y, dx, dy) per step → MLP → MaxPool over T.
     Input:  [M, T, 2]   absolute trajectory
     Output: [M, out_dim]
@@ -289,6 +283,10 @@ class MLPDecoder(nn.Module):
         nn.init.zeros_(self.scene_proj.bias)
         self.scene_guidance_scale = 1.0
         self.diag_scn_ratio = 0.0   # ‖scene query delta‖ / ‖base_q‖, no grad
+        # D1-③ (§10.2): RMS magnitude of the learned residual control points vs the
+        # CV prior. <<1 → CV prior dominates → the game cannot deviate from straight
+        # line (negotiation pinned). No grad; holds the last forward's value.
+        self.diag_res_prior_ratio = 0.0
 
         # Endpoint-distribution diagnostic only (EMA online k-means of GT
         # endpoints). NOT used in the forward pass or the loss any more.
@@ -355,6 +353,13 @@ class MLPDecoder(nn.Module):
                   self.ctrl_times.to(res_ctrl.dtype).view(1, 1, -1, 1)  # [BN,1,n_ctrl,2]
         ctrl    = cv_ctrl + res_ctrl                             # [BN, K, n_ctrl, 2]
 
+        with torch.no_grad():
+            # D1-③: element-wise RMS ratio (shape-fair across K) — learned deviation
+            # magnitude relative to the CV prior.
+            res_rms = res_ctrl.float().pow(2).mean().sqrt()
+            cv_rms  = cv_ctrl.float().pow(2).mean().sqrt().clamp(min=1e-6)
+            self.diag_res_prior_ratio = (res_rms / cv_rms).item()
+
         # Bézier decode: C∞-smooth position offsets from current position (no cumsum)
         traj     = torch.einsum('tc,bkcd->bktd',
                                 self.bezier_basis.to(ctrl.dtype), ctrl)  # [BN, K, T, 2]
@@ -367,16 +372,22 @@ class InteractionDecoder(nn.Module):
     """
     Level-k Interaction Decoder — aligned with GameFormer's original design.
 
-    Key GameFormer principles adopted:
+    Key GameFormer principles adopted (exp16/17: re-aligned with the paper):
       1. SelfTransformer first: self-attention across ALL agents captures global
          interaction context before individual refinement (GameFormer core).
       2. Per-level independent modules (GameFormer uses separate InteractionDecoder
          per level): eliminates cross-level gradient accumulation on shared weights.
       3. cross_attn_dim=128 (GameFormer=256; 128 safer given our H=1024 inputs).
       4. FutureEncoder: MLP+MaxPool, replaces GRU (eliminates 60-step BPTT).
-      5. Detach query in cross-attention: gradient reaches h_agents ONLY through
-         the residual, not through the attention computation.
-      6. Detach h_cur between levels: stops multi-level gradient cascade.
+      5. (exp16) Query NOT detached + h_cur NOT detached between levels: the game is
+         fully end-to-end, matching GameFormer (which carries query content Z_{k-1}
+         forward across levels with full gradient). Bezier (no cumsum) + n_levels<=2
+         keep the chain short and safe; this is the primary fix for the shallow
+         trainable-geometry pathway diagnosed in the plan.
+      6. (exp17) Cross-attention K/V = [future-interaction ⊕ scene memory], where the
+         scene memory is RGSF's fused [agent;lane] geometric tokens (GameFormer's
+         scene-context C_s role). Restores the deep trainable memory the frozen LLM
+         had displaced. Falls back to K/V=interaction when no memory is supplied.
       7. Zero-init out_proj: interaction starts as identity (activated gradually).
       8. FFN after cross-attention: GameFormer's full transformer block structure.
     """
@@ -386,8 +397,18 @@ class InteractionDecoder(nn.Module):
         self.traj_decoder = traj_decoder
         self.n_levels     = n_levels
 
+        # D1-①/② (§10.2): negotiation diagnostics, no grad, hold last forward's value.
+        self.diag_level_delta    = 0.0   # mean ‖traj_k − traj_{k-1}‖ — is the game moving?
+        self.diag_conflict_ratio = 0.0   # Δ in conflict windows / Δ elsewhere — real
+                                         # negotiation (>1) vs global smooth drift (≈1)
+        self.conflict_margin     = 5.0   # m, interaction zone for the conflict mask
+
         # Shared FutureEncoder across levels (GameFormer shares future_encoder)
         self.future_enc  = FutureEncoder(out_dim=cross_attn_dim)
+
+        # exp17: project H-dim scene-memory tokens (RGSF fused [agent;lane]) down to
+        # the decoder's cross_attn_dim so they can serve as cross-attention K/V.
+        self.mem_proj    = nn.Linear(hidden_dim, cross_attn_dim)
 
         # ── Per-level independent modules (GameFormer: separate decoder per level) ──
         # SelfTransformer: global interaction context across ALL agents
@@ -419,16 +440,19 @@ class InteractionDecoder(nn.Module):
             nn.init.zeros_(op.weight)
             nn.init.zeros_(op.bias)
 
-    def _refine(self, h_agents, prev_trajs, level_idx, agent_valid=None):
+    def _refine(self, h_agents, prev_trajs, level_idx, agent_valid=None,
+                mem=None, mem_pad=None):
         """
         h_agents:    [B, N, H]
         prev_trajs:  [B, N, K, T, 2]  — gradient-connected (e2e; Bezier makes this safe)
         agent_valid: [B, N] bool       — mask padding agents from self-attention KV
+        mem:         [B, M, D] or None — scene-memory tokens (RGSF), already projected
+        mem_pad:     [B, M] bool or None — True = padding token to ignore
         Returns:     [B, N, H]
         """
         B, N, H = h_agents.shape
 
-        # Step 1: Encode ALL agents' mean futures (MLP+MaxPool, detached)
+        # Step 1: Encode ALL agents' mean futures (MLP+MaxPool)
         K_mean  = prev_trajs.mean(dim=2)                         # [B, N, T, 2]
         T       = K_mean.shape[2]
         fut_emb = self.future_enc(
@@ -437,19 +461,34 @@ class InteractionDecoder(nn.Module):
 
         # Step 2: SelfTransformer — global interaction context (GameFormer key step)
         # key_padding_mask: True = ignore (padding agents should not attend as KV)
-        pad_mask = None
+        agent_pad = None
         if agent_valid is not None:
-            pad_mask = ~agent_valid                               # [B, N], True=padding
+            agent_pad = ~agent_valid                              # [B, N], True=padding
         sa_out, _ = self.self_attns[level_idx](fut_emb, fut_emb, fut_emb,
-                                               key_padding_mask=pad_mask)
+                                               key_padding_mask=agent_pad)
         interaction = self.sa_norms[level_idx](fut_emb + sa_out) # [B, N, D]
 
         # Step 3: CrossTransformer — per-agent refinement
-        # GameFormer: query = last_content + multi_futures (combines prev repr + future context)
-        # Detach query: gradient to h_agents flows through residual only (not attn path)
-        q       = self.q_projs[level_idx](h_agents.detach())     # [B, N, D]
+        # (exp16) query NOT detached: gradient reaches h_agents through both the
+        #          attention path and the residual (full e2e, GameFormer-faithful).
+        # (exp17) K/V = [future-interaction ⊕ scene memory] so each agent can re-query
+        #          the geometric scene (RGSF tokens), not just other agents' futures.
+        q       = self.q_projs[level_idx](h_agents)             # [B, N, D]
         query   = q + interaction                                 # [B, N, D]
-        ca_out, _ = self.cross_attns[level_idx](query, interaction, interaction)
+        if mem is not None:
+            kv      = torch.cat([interaction, mem], dim=1)       # [B, N+M, D]
+            if agent_pad is not None or mem_pad is not None:
+                ipad = agent_pad if agent_pad is not None else \
+                       torch.zeros(B, N, dtype=torch.bool, device=query.device)
+                mpad = mem_pad if mem_pad is not None else \
+                       torch.zeros(B, mem.shape[1], dtype=torch.bool, device=query.device)
+                kv_pad = torch.cat([ipad, mpad], dim=1)          # [B, N+M]
+            else:
+                kv_pad = None
+        else:
+            kv, kv_pad = interaction, agent_pad
+        ca_out, _ = self.cross_attns[level_idx](query, kv, kv,
+                                               key_padding_mask=kv_pad)
         ca_out  = self.ca_norms[level_idx](query + ca_out)       # [B, N, D]
 
         # Step 4: FFN (GameFormer's full transformer block)
@@ -460,13 +499,16 @@ class InteractionDecoder(nn.Module):
         correction = self.out_projs[level_idx](ca_out)           # [B, N, H]
         return self.out_norms[level_idx](h_agents + correction)
 
-    def forward(self, h_agents, gt_anchor, v_last, h_scn, agent_valid=None):
+    def forward(self, h_agents, gt_anchor, v_last, h_scn, agent_valid=None,
+                scene_memory=None, scene_valid=None):
         """
-        h_agents:    [B, N, H]
-        gt_anchor:   [B, N, 2]
-        v_last:      [B, N, 2]  last observed velocity (CV prior for the decoder)
-        h_scn:       [B, H]     LLM scene-summary hidden (scenario-query guidance)
-        agent_valid: [B, N] bool  — propagated to _refine for padding mask
+        h_agents:     [B, N, H]
+        gt_anchor:    [B, N, 2]
+        v_last:       [B, N, 2]  last observed velocity (CV prior for the decoder)
+        h_scn:        [B, H]     LLM scene-summary hidden (scenario-query guidance)
+        agent_valid:  [B, N] bool  — propagated to _refine for padding mask
+        scene_memory: [B, M, H] or None — RGSF fused [agent;lane] tokens (exp17 K/V)
+        scene_valid:  [B, M] bool or None — True = real token, False = padding
         Returns:     (all_preds, all_scores)
                      all_preds:  list of [B, N, K, T, 2] position offsets from current
                                  position, length = n_levels + 1
@@ -474,6 +516,13 @@ class InteractionDecoder(nn.Module):
         """
         B, N, H = h_agents.shape
         v_flat  = v_last.reshape(B * N, 2)
+
+        # exp17: project scene memory once (shared across levels). mem_pad: True=ignore.
+        mem = mem_pad = None
+        if scene_memory is not None:
+            mem = self.mem_proj(scene_memory)                    # [B, M, D]
+            if scene_valid is not None:
+                mem_pad = ~scene_valid                           # [B, M]
 
         # Level-0: pure encoder-decoder, no interaction (GameFormer: InitialDecoder)
         traj_pos, score = self.traj_decoder(h_agents.reshape(B * N, H), v_flat, h_scn)
@@ -491,14 +540,56 @@ class InteractionDecoder(nn.Module):
             # E2E: traj_abs and h_cur are NOT detached — gradient flows back through
             # FutureEncoder (trajectory context) and across levels to the decoder.
             # Safe with Bezier (no cumsum amplification) and n_levels<=2 (short chain).
-            h_cur = self._refine(h_cur, traj_abs, level_idx, agent_valid)
+            h_cur = self._refine(h_cur, traj_abs, level_idx, agent_valid,
+                                 mem=mem, mem_pad=mem_pad)
             traj_pos_k, score_k = self.traj_decoder(h_cur.reshape(B * N, H), v_flat, h_scn)
             traj_pos_k = traj_pos_k.reshape(B, N, K, T, 2)
             traj_abs   = anchor + traj_pos_k
             all_preds.append(traj_pos_k)
             all_scores.append(score_k.reshape(B, N, K))
 
+        with torch.no_grad():
+            self._compute_diag(all_preds, anchor, agent_valid)
+
         return all_preds, all_scores
+
+    def _compute_diag(self, all_preds, anchor, agent_valid):
+        """D1 negotiation diagnostics (§10.2). Read-only; no effect on training.
+        all_preds: list of [B,N,K,T,2] offsets; anchor: [B,N,1,1,2]; agent_valid: [B,N].
+        """
+        if len(all_preds) < 2:
+            return
+        B, N, K, T, _ = all_preds[0].shape
+        valid = (agent_valid if agent_valid is not None
+                 else torch.ones(B, N, dtype=torch.bool, device=all_preds[0].device))
+        vm = valid.float()
+
+        # ① mean inter-level displacement over valid agents (offsets → anchor cancels)
+        deltas = [
+            (all_preds[k] - all_preds[k - 1]).float().norm(dim=-1).mean(dim=(2, 3))
+            for k in range(1, len(all_preds))
+        ]                                                          # each [B,N]
+        delta = torch.stack(deltas, 0).mean(0)                    # [B,N]
+        self.diag_level_delta = (
+            (delta * vm).sum() / vm.sum().clamp(min=1.0)).item()
+
+        # ② concentration of total negotiation Δ in conflict windows vs elsewhere.
+        a    = anchor[:, :, 0].float()                            # [B,N,1,2]
+        pos0 = a + all_preds[0].mean(dim=2).float()               # [B,N,T,2] level-0 occupancy
+        dist = (pos0.unsqueeze(2) - pos0.unsqueeze(1)).norm(dim=-1)  # [B,N,N,T]
+        eye  = torch.eye(N, dtype=torch.bool, device=dist.device)
+        j_bad = (~valid).view(B, 1, N, 1) | eye.view(1, N, N, 1)
+        dist = dist.masked_fill(j_bad, float("inf"))
+        mind = dist.min(dim=2).values                             # [B,N,T] nearest other agent
+        conflict = mind < self.conflict_margin                    # [B,N,T]
+
+        dispf = (all_preds[-1].mean(dim=2) - all_preds[0].mean(dim=2)) \
+            .float().norm(dim=-1)                                 # [B,N,T] total negotiation move
+        vmask = valid.view(B, N, 1).expand(-1, -1, T)
+        cmask, ncmask = conflict & vmask, (~conflict) & vmask
+        conf    = dispf[cmask].mean() if cmask.any() else dispf.new_tensor(float("nan"))
+        nonconf = dispf[ncmask].mean() if ncmask.any() else dispf.new_tensor(float("nan"))
+        self.diag_conflict_ratio = (conf / nonconf.clamp(min=1e-6)).item()
 
 
 # ── Agent → Lane Cross-Attention ──────────────────────────────────────────────
@@ -780,6 +871,10 @@ class HybridLLMPredictor(nn.Module):
         self.diag_corr_ratio = 0.0
         self.diag_lane_ratio = 0.0
         self.diag_scn_ratio  = 0.0   # ‖scene query delta‖/‖base_q‖ (decoder, exp12)
+        # D1 negotiation diagnostics (§10.2): mirrored from sub-modules each forward.
+        self.diag_level_delta     = 0.0   # mean ‖traj_k − traj_{k-1}‖
+        self.diag_conflict_ratio  = 0.0   # Δ in conflict windows / Δ elsewhere
+        self.diag_res_prior_ratio = 0.0   # ‖residual ctrl‖ / ‖CV-prior ctrl‖ (RMS)
 
         # Ablation knob: scale applied to llm_correction_proj output before adding
         # to agent_emb.  1.0 = normal operation.  0.0 = encoder-only (LLM correction
@@ -792,7 +887,6 @@ class HybridLLMPredictor(nn.Module):
             self.to(device)
 
     # ── Forward ───────────────────────────────────────────────────────────────
-
     def _build_inputs_embeds(self, text_input_ids, text_attention_mask,
                               agent_emb, lane_emb, N, L):
         """
@@ -831,7 +925,8 @@ class HybridLLMPredictor(nn.Module):
     def forward(self, text_input_ids, text_attention_mask,
                 agent_features, agent_valid,
                 lane_features, lane_valid,
-                gt_anchor):
+                gt_anchor,
+                agent_ctrs=None, agent_vecs=None):
         """
         Args:
             text_input_ids:      [B, L_t]
@@ -841,6 +936,8 @@ class HybridLLMPredictor(nn.Module):
             lane_features:       [B, L, 10, 8]
             lane_valid:          [B, L]  bool
             gt_anchor:           [B, N, 2]
+            agent_ctrs:          [B, N, 2]  agent t=49 positions in focal frame (optional)
+            agent_vecs:          [B, N, 2]  agent t=49 headings in focal frame (optional)
         Returns:
             all_preds:  list of [B, N, K, T, 2], length = n_levels + 1
             all_scores: list of [B, N, K],        length = n_levels + 1
@@ -868,12 +965,21 @@ class HybridLLMPredictor(nn.Module):
         # the LLM and decoder both see spatially structured tokens. Gradient to the
         # LaneEncoder flows through the agent↔lane attention (subsumes lane_cross).
         if self.rgsf is not None:
-            agent_ctrs = gt_anchor.to(agent_emb.dtype)                # [B,N,2] last valid pos
-            agent_vecs = agent_features[:, :, -1, 4:6].to(agent_emb.dtype)  # (cosθ,sinθ)
+            # Use focal-frame ctrs/vecs when provided (fixes the per-agent-local-frame bug
+            # where gt_anchor ≈ (0,0) and agent_features cosθ/sinθ ≈ (1,0) for all agents,
+            # making RGSF RPE geometrically blind to inter-agent distances).
+            if agent_ctrs is not None:
+                _agent_ctrs = agent_ctrs.to(agent_emb.dtype)          # [B,N,2] focal frame
+            else:
+                _agent_ctrs = gt_anchor.to(agent_emb.dtype)           # legacy fallback
+            if agent_vecs is not None:
+                _agent_vecs = agent_vecs.to(agent_emb.dtype)          # [B,N,2] focal frame
+            else:
+                _agent_vecs = agent_features[:, :, -1, 4:6].to(agent_emb.dtype)  # legacy
             lane_ctrs  = lane_features[..., 0:2].mean(dim=2).to(agent_emb.dtype)  # [B,L,2]
             lane_vecs  = lane_features[..., 2:4].mean(dim=2).to(agent_emb.dtype)  # [B,L,2]
-            ctrs  = torch.cat([agent_ctrs, lane_ctrs], dim=1)         # [B,T,2]
-            vecs  = torch.cat([agent_vecs, lane_vecs], dim=1)         # [B,T,2]
+            ctrs  = torch.cat([_agent_ctrs, lane_ctrs], dim=1)        # [B,T,2]
+            vecs  = torch.cat([_agent_vecs, lane_vecs], dim=1)        # [B,T,2]
             valid = torch.cat([agent_valid, lane_valid], dim=1)       # [B,T]
             a_fused, lane_emb = self.rgsf(agent_emb, lane_emb, ctrs, vecs, valid)
             with torch.no_grad():
@@ -881,6 +987,13 @@ class HybridLLMPredictor(nn.Module):
                 self.diag_rgsf_ratio = (((a_fused - agent_emb) * vm).norm()
                                         / (agent_emb * vm).norm().clamp(min=1e-6)).item()
             agent_emb = a_fused
+            # exp17: expose the fused [agent;lane] geometric tokens as the decoder's
+            # cross-attention scene memory (GameFormer's scene-context C_s role). Not
+            # detached → gradient flows to RGSF + both encoders through the decoder.
+            scene_memory = torch.cat([a_fused, lane_emb], dim=1)     # [B, N+L, H]
+            scene_valid  = torch.cat([agent_valid, lane_valid], dim=1)  # [B, N+L]
+        else:
+            scene_memory = scene_valid = None
 
         # ── LLM forward with DETACHED encoder outputs ─────────────────────────
         # Detaching prevents gradient from flowing back through 28 transformer
@@ -936,8 +1049,13 @@ class HybridLLMPredictor(nn.Module):
         v_last = agent_features[:, :, -1, 2:4].to(h_agents.dtype)        # [B, N, 2]
         v_last = v_last * agent_valid.unsqueeze(-1).to(v_last.dtype)     # zero pad agents
         all_preds, all_scores = self.interaction(
-            h_agents, gt_anchor, v_last, h_scn, agent_valid)
+            h_agents, gt_anchor, v_last, h_scn, agent_valid,
+            scene_memory=scene_memory, scene_valid=scene_valid)
         self.diag_scn_ratio = self.traj_decoder.diag_scn_ratio
+        # D1 (§10.2): surface negotiation diagnostics for the [Branch] log.
+        self.diag_level_delta     = self.interaction.diag_level_delta
+        self.diag_conflict_ratio  = self.interaction.diag_conflict_ratio
+        self.diag_res_prior_ratio = self.traj_decoder.diag_res_prior_ratio
         # The codebook is a pure endpoint-distribution diagnostic now (exp12):
         # the loss only triggers its EMA update; it no longer biases queries or
         # contributes an anchor-cls term.
